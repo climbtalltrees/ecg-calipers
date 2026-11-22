@@ -5,6 +5,9 @@ import {
   pxPerMm, pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia,
   type Calibration, type Point,
 } from './lib/measure'
+import { qrsFlag, qtcFlag, stFlag, axisFlag, type Flag, type Patient } from './lib/flags'
+import { REFS, RULES } from './lib/references'
+import { LEADS, stDeviationMm, heightMm, netQrsMm, frontalAxis, type Lead } from './lib/leads'
 
 type TimeType = 'R-R' | 'PR' | 'QRS' | 'QT' | 'P wave' | 'Other'
 type AmpType = 'P amp' | 'R amp' | 'S amp' | 'Other'
@@ -20,6 +23,20 @@ interface Caliper {
   beats: number // R-R only: how many intervals the span covers
   march: boolean
 }
+
+/** User-tapped points on one lead. STE: base, j, peak?. Axis: base, r, s. */
+interface Marker {
+  id: number
+  kind: 'ste' | 'axis'
+  lead: Lead
+  pts: Point[]
+}
+type Placing = null | { kind: 'ste' | 'axis'; lead: Lead | null; pts: Point[] }
+const STEPS: Record<'ste' | 'axis', string[]> = {
+  ste: ['the baseline (TP or PR segment)', 'the J point', 'the tallest point of the QRS (for the ST:QRS ratio)'],
+  axis: ['the baseline', 'the top of the R wave', 'the bottom of the S wave'],
+}
+const AXIS_LEADS: Lead[] = ['I', 'aVF', 'II']
 
 type CalStep = null | { axis: 'x' | 'y'; pts: Point[] }
 interface View { s: number; tx: number; ty: number }
@@ -41,11 +58,15 @@ export default function App() {
   const [calipers, setCalipers] = useState<Caliper[]>([])
   const [selected, setSelected] = useState<number | null>(null)
   const [sheet, setSheet] = useState(false)
+  const [markers, setMarkers] = useState<Marker[]>([])
+  const [placing, setPlacing] = useState<Placing>(null)
+  const [selMarker, setSelMarker] = useState<number | null>(null)
+  const [patient, setPatient] = useState<Patient>({ sex: 'unset', age: 'unset' })
 
   const vpRef = useRef<HTMLDivElement>(null)
   const pointers = useRef(new Map<number, { x: number; y: number }>())
   const gesture = useRef<{ startView: View; start: Map<number, { x: number; y: number }>; downAt: { x: number; y: number }; moved: boolean } | null>(null)
-  const drag = useRef<{ id: number; leg: 'a' | 'b' | 'bar'; last: Point } | null>(null)
+  const drag = useRef<{ id: number; leg: 'a' | 'b' | 'bar'; last: Point } | { marker: number; idx: number; last: Point } | null>(null)
 
   const calibratedX = !!cal.pxPerMmX
   const calibratedY = !!cal.pxPerMmY
@@ -59,6 +80,8 @@ export default function App() {
       const loaded = await loadFile(file)
       setImg(loaded)
       setCalipers([])
+      setMarkers([])
+      setPlacing(null)
       setCal(c => ({ paperSpeedMmPerS: c.paperSpeedMmPerS, gainMmPerMv: c.gainMmPerMv }))
       setCalStep({ axis: 'x', pts: [] })
     } catch (e) {
@@ -143,6 +166,25 @@ export default function App() {
       else setCalStep({ ...calStep, pts })
       return
     }
+    if (placing && placing.lead) {
+      const pts = [...placing.pts, p]
+      if (pts.length === 3) commitPlacing(pts)
+      else setPlacing({ ...placing, pts })
+      return
+    }
+    setSelected(null)
+    setSelMarker(null)
+  }
+
+  const commitPlacing = (pts: Point[]) => {
+    if (!placing?.lead) return
+    const lead = placing.lead
+    const kind = placing.kind
+    const m: Marker = { id: nextId++, kind, lead, pts }
+    // One marker per lead per tool: re-measuring a lead replaces it.
+    setMarkers(ms => [...ms.filter(x => !(x.kind === kind && x.lead === lead)), m])
+    setPlacing(null)
+    setSelMarker(m.id)
     setSelected(null)
   }
 
@@ -186,10 +228,24 @@ export default function App() {
     vpRef.current!.setPointerCapture(e.pointerId)
     drag.current = { id, leg, last: toImage(e.clientX, e.clientY) }
     setSelected(id)
+    setSelMarker(null)
+  }
+  const onPointDown = (e: RPointerEvent, marker: number, idx: number) => {
+    e.stopPropagation()
+    vpRef.current!.setPointerCapture(e.pointerId)
+    drag.current = { marker, idx, last: toImage(e.clientX, e.clientY) }
+    setSelMarker(marker)
+    setSelected(null)
   }
   const onHandleMove = (e: RPointerEvent) => {
     const d = drag.current!
     const p = toImage(e.clientX, e.clientY)
+    if ('marker' in d) {
+      const dx = p.x - d.last.x, dy = p.y - d.last.y
+      d.last = p
+      setMarkers(ms => ms.map(m => m.id !== d.marker ? m : { ...m, pts: m.pts.map((q, i) => i === d.idx ? { x: q.x + dx, y: q.y + dy } : q) }))
+      return
+    }
     const dx = p.x - d.last.x, dy = p.y - d.last.y
     d.last = p
     setCalipers(cs => cs.map(c => {
@@ -232,7 +288,32 @@ export default function App() {
     }
   }, [calipers, valueOf, calibratedX, fullCal])
 
+  const stRows = useMemo(() => {
+    if (!cal.pxPerMmY) return []
+    return markers.filter(m => m.kind === 'ste')
+      .sort((a, b) => LEADS.indexOf(a.lead) - LEADS.indexOf(b.lead))
+      .map(m => {
+        const st = stDeviationMm(m.pts[0], m.pts[1], cal.pxPerMmY!)
+        const hasPeak = m.pts[2] && (m.pts[2].x !== m.pts[1].x || m.pts[2].y !== m.pts[1].y)
+        const q = hasPeak ? heightMm(m.pts[0], m.pts[2], cal.pxPerMmY!) : null
+        const mv = st / (cal.gainMmPerMv ?? 10)
+        return { lead: m.lead, st, mv, ratio: q ? Math.abs(st) / q : null, flag: stFlag(m.lead, mv, patient) }
+      })
+  }, [markers, cal.pxPerMmY, cal.gainMmPerMv, patient])
+
+  const axis = useMemo(() => {
+    if (!cal.pxPerMmY) return { deg: null as number | null, nets: {} as Partial<Record<Lead, number>> }
+    const nets: Partial<Record<Lead, number>> = {}
+    for (const m of markers) if (m.kind === 'axis') nets[m.lead] = netQrsMm(m.pts[0], m.pts[1], m.pts[2], cal.pxPerMmY)
+    return { deg: frontalAxis(nets), nets }
+  }, [markers, cal.pxPerMmY])
+
   const sel = calipers.find(c => c.id === selected) || null
+  const selM = markers.find(m => m.id === selMarker) || null
+  const startPlacing = (kind: 'ste' | 'axis') => {
+    if (!cal.pxPerMmY) { setErr('Calibrate voltage (vertical) first: tap Calibrate.'); return }
+    setPlacing({ kind, lead: null, pts: [] }); setSelected(null); setSelMarker(null)
+  }
   const hs = 1 / view.s // keeps handles a constant size on screen
 
   // ---------- render ----------
@@ -258,7 +339,9 @@ export default function App() {
     )
   }
 
-  const status = calStep
+  const status = placing?.lead
+    ? `${placing.lead}: tap ${STEPS[placing.kind][placing.pts.length]}`
+    : calStep
     ? `Calibrate ${calStep.axis === 'x' ? 'time (horizontal)' : 'voltage (vertical)'}: tap ${calStep.pts.length === 0 ? 'the first' : 'the second'} point across a known span of grid`
     : !calibratedX ? 'Calibrate time to see measurements' : null
 
@@ -270,9 +353,6 @@ export default function App() {
         <button className="btn ghost" onClick={() => setSheet(true)}>Results</button>
       </header>
 
-      {status && <div className="status">{status}{calStep && <button className="link" onClick={() => setCalStep(null)}>Cancel</button>}</div>}
-      {err && <div className="status err" onClick={() => setErr(null)}>{err} (tap to dismiss)</div>}
-
       <div
         className="viewport"
         ref={vpRef}
@@ -282,11 +362,21 @@ export default function App() {
         onPointerCancel={onVpUp}
         onWheel={onWheel}
       >
+        <div className="hud" onPointerDown={e => e.stopPropagation()}>
+      {status && <div className="status">{status}{calStep && <button className="link" onClick={() => setCalStep(null)}>Cancel</button>}
+        {placing?.lead && placing.pts.length === 2 && <button className="link" onClick={() => commitPlacing([...placing.pts, placing.kind === 'axis' ? placing.pts[0] : placing.pts[1]])}>{placing.kind === 'axis' ? 'No S wave' : 'Skip'}</button>}
+        {placing?.lead && <button className="link" onClick={() => setPlacing(null)}>Cancel</button>}</div>}
+      {err && <div className="status err" onClick={() => setErr(null)}>{err} (tap to dismiss)</div>}
+        </div>
         <div className="stage" style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`, width: img.w, height: img.h }}>
           <img src={img.src} width={img.w} height={img.h} draggable={false} alt="ECG" />
-          <svg className="overlay" width={img.w} height={img.h} viewBox={`0 0 ${img.w} ${img.h}`}>
+          <svg className={`overlay ${placing?.lead || calStep ? 'tapping' : ''}`} width={img.w} height={img.h} viewBox={`0 0 ${img.w} ${img.h}`}>
             {(calStep?.pts ?? calPrompt?.pts ?? []).map((p, i) => (
               <circle key={i} cx={p.x} cy={p.y} r={7 * hs} className="calpt" />
+            ))}
+            {placing?.pts.map((p, i) => <circle key={`p${i}`} cx={p.x} cy={p.y} r={6 * hs} className="calpt" />)}
+            {cal.pxPerMmY && markers.map(m => (
+              <MarkerShape key={m.id} m={m} hs={hs} pxPerMmY={cal.pxPerMmY!} selected={m.id === selMarker} onDown={onPointDown} />
             ))}
             {calipers.map(c => (
               <CaliperShape key={c.id} c={c} hs={hs} h={img.h} w={img.w} selected={c.id === selected}
@@ -300,6 +390,31 @@ export default function App() {
           <button className="btn round" onClick={fit} aria-label="Fit">⤢</button>
         </div>
       </div>
+
+      {placing && !placing.lead && (
+        <div className="panel">
+          <div className="row"><b>{placing.kind === 'ste' ? 'ST: which lead?' : 'Axis: which lead?'}</b><span className="grow" /><button className="btn small" onClick={() => setPlacing(null)}>Cancel</button></div>
+          <div className="chips wrap">
+            {(placing.kind === 'axis' ? AXIS_LEADS : [...LEADS]).map(l => {
+              const done = markers.some(m => m.kind === placing.kind && m.lead === l)
+              return <button key={l} className={`chip ${done ? 'on' : ''}`} style={{ '--c': placing.kind === 'ste' ? '#dc2626' : '#0d9488' } as React.CSSProperties}
+                onClick={() => setPlacing({ ...placing, lead: l })}>{l}{l === 'II' && placing.kind === 'axis' ? ' (optional)' : ''}</button>
+            })}
+          </div>
+          {placing.kind === 'axis' && <p className="fine">Measure I and aVF; adding II refines the result. Re-tapping a lead replaces it.</p>}
+        </div>
+      )}
+
+      {selM && !placing && (
+        <div className="panel">
+          <div className="row">
+            <b>{selM.kind === 'ste' ? 'ST' : 'Axis'} · {selM.lead}</b>
+            <span className="fine">Drag any dot to adjust.</span>
+            <span className="grow" />
+            <button className="btn small danger" onClick={() => { setMarkers(ms => ms.filter(m => m.id !== selM.id)); setSelMarker(null) }}>Delete</button>
+          </div>
+        </div>
+      )}
 
       {sel && (
         <div className="panel">
@@ -330,7 +445,9 @@ export default function App() {
       <nav className="tools">
         <button className="btn" onClick={() => setCalStep({ axis: 'x', pts: [] })}>Calibrate</button>
         <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('time')}>⟷ Time</button>
-        <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('amp')}>↕ Amplitude</button>
+        <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('amp')}>↕ Amp</button>
+        <button className="btn ste" disabled={!!calStep} onClick={() => startPlacing('ste')}>STE</button>
+        <button className="btn" disabled={!!calStep} onClick={() => startPlacing('axis')}>Axis</button>
       </nav>
 
       {calPrompt && <CalPrompt axis={calPrompt.axis} onDone={finishCal} onCancel={() => setCalPrompt(null)} />}
@@ -340,14 +457,26 @@ export default function App() {
           <div className="sheet" onClick={e => e.stopPropagation()}>
             <h2>Measurements</h2>
             <Settings cal={cal} setCal={setCal} />
+            <div className="row settings">
+              <label>Sex
+                <select value={patient.sex} onChange={e => setPatient(p => ({ ...p, sex: e.target.value as Patient['sex'] }))}>
+                  <option value="unset">Not set</option><option value="male">Male</option><option value="female">Female</option>
+                </select>
+              </label>
+              <label>Age
+                <select value={patient.age} onChange={e => setPatient(p => ({ ...p, age: e.target.value as Patient['age'] }))}>
+                  <option value="unset">Not set</option><option value="under40">16–39</option><option value="40plus">40+</option>
+                </select>
+              </label>
+            </div>
             <table>
               <tbody>
                 <Row k="Heart rate" v={fmt(results.rate, 0, '/min')} sub={results.rrMs ? `R-R ${fmt(results.rrMs, 0, ' ms')}` : undefined} />
                 <Row k="PR" v={fmt(results.pr, 0, ' ms')} />
-                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} />
+                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} flag={qrsFlag(results.qrs)} />
                 <Row k="QT" v={fmt(results.qt, 0, ' ms')} />
-                <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} />
-                <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} />
+                <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} flag={qtcFlag(results.qtcB, patient)} />
+                <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} flag={qtcFlag(results.qtcF, patient)} />
                 <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} />
                 <Row k="P amplitude" v={fmt(results.pAmp, 2, ' mV')} />
                 <Row k="R amplitude" v={fmt(results.rAmp, 2, ' mV')} />
@@ -355,7 +484,23 @@ export default function App() {
                 <Row k="R:S ratio" v={fmt(results.rs, 2, '')} />
               </tbody>
             </table>
-            <p className="fine">Values come only from calipers you placed. QTc needs an R-R and a QT caliper. Normal-range flags will be added once each limit is checked against its cited guideline.</p>
+            {stRows.length > 0 && (
+              <>
+                <h3>ST deviation at the J point</h3>
+                <table><tbody>
+                  {stRows.map(r => <Row key={r.lead} k={r.lead} v={`${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`} sub={`${r.mv >= 0 ? '+' : '−'}${Math.abs(r.mv).toFixed(2)} mV${r.ratio != null ? ` · ST:QRS ${r.ratio.toFixed(2)}` : ''}`} flag={r.flag} />)}
+                </tbody></table>
+              </>
+            )}
+            <h3>Frontal QRS axis</h3>
+            <table><tbody>
+              <Row k="Axis" v={axis.deg == null ? '—' : `${axis.deg >= 0 ? '+' : '−'}${Math.abs(Math.round(axis.deg))}°`}
+                flag={axisFlag(axis.deg)}
+                sub={Object.keys(axis.nets).length ? (Object.entries(axis.nets) as [Lead, number][]).map(([l, v]) => `${l} ${v >= 0 ? '+' : ''}${v.toFixed(1)} mm`).join(' · ') : 'Use Axis to measure leads I and aVF'} />
+            </tbody></table>
+            <p className="fine">Values come only from points you placed. Flags are for adults (over 16) and compare each value with the cited guideline; tap a flag to see the source's words. They are reference marks, not a diagnosis. The ST flags look at one lead at a time: contiguous-lead criteria are yours to apply. Part IV recommends regression-based QT correction over Bazett; Bazett and Fridericia are shown side by side for comparison.</p>
+            <h3>Sources</h3>
+            {Object.values(REFS).map(r => <p key={r.id} className="fine"><a href={r.url} target="_blank" rel="noreferrer">{r.citation}</a></p>)}
             <button className="btn primary" onClick={() => setSheet(false)}>Done</button>
           </div>
         </div>
@@ -406,6 +551,54 @@ function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
       <circle cx={x} cy={c.a.y} r={6 * hs} fill={col} />
       <circle cx={x} cy={c.b.y} r={6 * hs} fill={col} />
       <Tag x={x + 10 * hs} y={(c.a.y + c.b.y) / 2} hs={hs} text={label} col={col} anchor="start" />
+    </g>
+  )
+}
+
+function MarkerShape({ m, hs, pxPerMmY, selected, onDown }: {
+  m: Marker; hs: number; pxPerMmY: number; selected: boolean
+  onDown: (e: RPointerEvent, id: number, idx: number) => void
+}) {
+  const col = m.kind === 'ste' ? '#dc2626' : '#0d9488'
+  const [base, p1, p2] = m.pts
+  const mm = pxPerMmY
+  const halfW = 40 * mm // baseline line spans 40 mm either side of the J point
+  const sw = (selected ? 2.25 : 1.5) * hs
+  const dots = m.pts.map((p, i) => (
+    <g key={i}>
+      <circle cx={p.x} cy={p.y} r={5 * hs} fill={i === 0 ? '#fff' : col} stroke={col} strokeWidth={2 * hs} />
+      <circle cx={p.x} cy={p.y} r={18 * hs} fill="transparent" className="grab" onPointerDown={e => onDown(e, m.id, i)} />
+    </g>
+  ))
+  if (m.kind === 'axis') {
+    const net = netQrsMm(base, p1, p2, pxPerMmY)
+    return (
+      <g>
+        <line x1={base.x - halfW / 2} x2={base.x + halfW / 2} y1={base.y} y2={base.y} stroke={col} strokeWidth={sw} strokeDasharray={`${6 * hs} ${4 * hs}`} />
+        {dots}
+        <Tag x={p1.x + 12 * hs} y={p1.y} hs={hs} col={col} anchor="start" text={`${m.lead} net ${net >= 0 ? '+' : ''}${net.toFixed(1)} mm`} />
+      </g>
+    )
+  }
+  // STE: baseline across the lead, a mm ruler at the J point, and a line at the J level.
+  const st = stDeviationMm(base, p1, pxPerMmY)
+  const q = p2 && (p2.x !== p1.x || p2.y !== p1.y) ? heightMm(base, p2, pxPerMmY) : null
+  const n = Math.max(3, Math.ceil(Math.abs(st)) + 2)
+  const ticks = []
+  for (let i = -n; i <= n; i++) {
+    const y = base.y - i * mm
+    const len = (i % 5 === 0 ? 4 : 2) * mm
+    ticks.push(<line key={i} x1={p1.x - len} x2={p1.x} y1={y} y2={y} stroke={col} strokeWidth={(i === 0 ? 1.5 : 1) * hs} />)
+  }
+  return (
+    <g>
+      <line x1={p1.x - halfW} x2={p1.x + halfW} y1={base.y} y2={base.y} stroke={col} strokeWidth={sw} strokeDasharray={`${6 * hs} ${4 * hs}`} />
+      <line x1={p1.x} x2={p1.x + 10 * mm} y1={p1.y} y2={p1.y} stroke={col} strokeWidth={sw} />
+      <line x1={p1.x} x2={p1.x} y1={base.y - n * mm} y2={base.y + n * mm} stroke={col} strokeWidth={hs} />
+      {ticks}
+      {dots}
+      <Tag x={p1.x + 12 * hs} y={p1.y - 10 * hs} hs={hs} col={col} anchor="start"
+        text={`${m.lead} ST ${st >= 0 ? '+' : '−'}${Math.abs(st).toFixed(1)} mm${q ? ` · ${(Math.abs(st) / q).toFixed(2)} of QRS` : ''}`} />
     </g>
   )
 }
@@ -471,8 +664,22 @@ function Settings({ cal, setCal }: { cal: Partial<Calibration>; setCal: (f: (c: 
   )
 }
 
-function Row({ k, v, sub }: { k: string; v: string; sub?: string }) {
-  return <tr><th>{k}{sub && <small>{sub}</small>}</th><td>{v}</td></tr>
+function Row({ k, v, sub, flag }: { k: string; v: string; sub?: string; flag?: Flag | null }) {
+  const [open, setOpen] = useState(false)
+  const rule = flag ? RULES[flag.rule] : null
+  return (
+    <tr>
+      <th>{k}{sub && <small>{sub}</small>}
+        {flag && rule && (
+          <button className={`flag ${flag.level}`} onClick={() => setOpen(o => !o)}>
+            {flag.text} <span className="src">· {REFS[rule.ref].short}, p. {rule.page}</span>
+            {open && <q>{rule.quote}</q>}
+          </button>
+        )}
+      </th>
+      <td>{v}</td>
+    </tr>
+  )
 }
 
 function labelFor(c: Caliper, v: number | null): string {

@@ -58,7 +58,7 @@ body { background: var(--bg); color: var(--text); overscroll-behavior: none; }
 .grow { flex: 1; }
 .beats { display: flex; align-items: center; gap: 6px; font-size: 14px; }
 
-.tools { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 8px 12px; padding-bottom: max(8px, env(safe-area-inset-bottom)); background: var(--surface); border-top: 1px solid var(--line); }
+.tools { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; padding: 8px 12px; padding-bottom: max(8px, env(safe-area-inset-bottom)); background: var(--surface); border-top: 1px solid var(--line); }
 
 .sheet-bg { position: fixed; inset: 0; background: rgb(0 0 0 / 0.45); display: flex; align-items: flex-end; justify-content: center; z-index: 10; }
 .sheet { background: var(--surface); width: 100%; max-width: 520px; max-height: 88dvh; overflow: auto; border-radius: 16px 16px 0 0; padding: 16px; padding-bottom: max(16px, env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 12px; }
@@ -72,3 +72,20 @@ th, td { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 15px; 
 th { text-align: left; font-weight: 500; }
 th small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
 td { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+
+.tools .btn { padding: 10px 4px; font-size: 14px; }
+.btn.ste { border-color: #dc2626; color: #dc2626; }
+.chips.wrap { flex-wrap: wrap; }
+.sheet h3 { margin: 8px 0 0; font-size: 15px; color: var(--muted); }
+.overlay.tapping .grab { pointer-events: none; }
+.hud { position: absolute; top: 0; left: 0; right: 0; z-index: 5; }
+.hud:empty { display: none; }
+.status { box-shadow: 0 1px 3px rgb(0 0 0 / 0.2); }
+.flag { display: block; text-align: left; margin-top: 4px; border: 0; border-left: 3px solid; padding: 3px 8px; font: inherit; font-size: 13px; font-weight: 600; background: transparent; cursor: pointer; color: var(--text); }
+.flag.high { border-color: #dc2626; color: #b91c1c; }
+.flag.low { border-color: #2563eb; color: #1d4ed8; }
+.flag.info { border-color: #94a3b8; color: var(--muted); font-weight: 500; }
+.flag .src { font-weight: 400; color: var(--muted); }
+.flag q { display: block; margin-top: 4px; font-weight: 400; font-style: italic; color: var(--text); }
+.sheet a { color: inherit; }
+@media (prefers-color-scheme: dark) { .flag.high { color: #fca5a5; } .flag.low { color: #93c5fd; } }

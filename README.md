@@ -13,8 +13,8 @@ Installable web app (PWA) for measuring real ECGs with calipers you place yourse
 - [x] Amplitude calipers: P, R, S; R:S ratio
 - [x] QTc by Bazett and Fridericia
 - [ ] Perspective correction for angled photos
-- [ ] Axis from leads I and aVF (II optional)
-- [ ] STE tool: user-tapped baseline and J point per lead, mm line, ST deviation, ST:QRS ratio
+- [x] Axis from leads I and aVF (II optional)
+- [x] STE tool: user-tapped baseline and J point per lead, mm line, ST deviation, ST:QRS ratio
 - [ ] Cited adult normal-range and ST-threshold flags (AHA/ACC/HRS; Universal Definition of MI)
 - [ ] Export with crop-out-identifiers prompt
 

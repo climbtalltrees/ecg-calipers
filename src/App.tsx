@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as RPointerEvent } from 'react'
 import { loadFile, type LoadedImage } from './lib/loadImage'
+import { straighten } from './lib/warp'
+import { exportView } from './lib/exportView'
 import {
   pxPerMm, pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia,
   type Calibration, type Point,
@@ -38,7 +40,7 @@ const STEPS: Record<'ste' | 'axis', string[]> = {
 }
 const AXIS_LEADS: Lead[] = ['I', 'aVF', 'II']
 
-type CalStep = null | { axis: 'x' | 'y'; pts: Point[] }
+type CalStep = null | { axis: 'x' | 'y' | 'quad'; pts: Point[] }
 interface View { s: number; tx: number; ty: number }
 
 const COLORS: Record<string, string> = {
@@ -55,6 +57,10 @@ export default function App() {
   const [cal, setCal] = useState<Partial<Calibration>>({ paperSpeedMmPerS: 25, gainMmPerMv: 10 })
   const [calStep, setCalStep] = useState<CalStep>(null)
   const [calPrompt, setCalPrompt] = useState<null | { axis: 'x' | 'y'; pts: Point[] }>(null)
+  const [calChoice, setCalChoice] = useState(false)
+  const [quadPrompt, setQuadPrompt] = useState<Point[] | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
   const [calipers, setCalipers] = useState<Caliper[]>([])
   const [selected, setSelected] = useState<number | null>(null)
   const [sheet, setSheet] = useState(false)
@@ -83,7 +89,8 @@ export default function App() {
       setMarkers([])
       setPlacing(null)
       setCal(c => ({ paperSpeedMmPerS: c.paperSpeedMmPerS, gainMmPerMv: c.gainMmPerMv }))
-      setCalStep({ axis: 'x', pts: [] })
+      setCalStep(null)
+      setCalChoice(true)
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Could not open that file')
     }
@@ -162,6 +169,11 @@ export default function App() {
   const onTap = (p: Point) => {
     if (calStep) {
       const pts = [...calStep.pts, p]
+      if (calStep.axis === 'quad') {
+        if (pts.length === 4) { setCalStep(null); setQuadPrompt(pts) }
+        else setCalStep({ ...calStep, pts })
+        return
+      }
       if (pts.length === 2) { setCalStep(null); setCalPrompt({ axis: calStep.axis, pts }) }
       else setCalStep({ ...calStep, pts })
       return
@@ -200,6 +212,43 @@ export default function App() {
       setErr(e instanceof Error ? e.message : 'Calibration failed')
       setCalPrompt(null)
     }
+  }
+
+  const finishQuad = async (wMm: number, hMm: number) => {
+    if (!quadPrompt || !img) return
+    const taps = quadPrompt
+    setQuadPrompt(null)
+    setBusy('Straightening photo…')
+    try {
+      // Let the busy banner paint before the heavy pixel loop.
+      await new Promise(r => setTimeout(r, 30))
+      const out = await straighten(img.src, taps, wMm, hMm)
+      setImg({ ...img, src: out.src, w: out.w, h: out.h })
+      setCal(c => ({ ...c, pxPerMmX: out.pxPerMm, pxPerMmY: out.pxPerMm }))
+      setCalipers([]); setMarkers([]); setSelected(null); setSelMarker(null)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not straighten that photo')
+    } finally { setBusy(null) }
+  }
+
+  const doExport = async () => {
+    setExporting(false)
+    const vp = vpRef.current, el = vp?.querySelector('.stage img') as HTMLImageElement | null, svg = vp?.querySelector('svg.overlay') as SVGSVGElement | null
+    if (!vp || !el || !svg || !img) return
+    setSelected(null); setSelMarker(null)
+    setBusy('Preparing export…')
+    try {
+      const lines: string[] = []
+      const add = (k: string, v: string) => { if (v !== '—') lines.push(`${k} ${v}`) }
+      add('Rate', fmt(results.rate, 0, '/min')); add('PR', fmt(results.pr, 0, ' ms')); add('QRS', fmt(results.qrs, 0, ' ms'))
+      add('QT', fmt(results.qt, 0, ' ms')); add('QTc Bazett', fmt(results.qtcB, 0, ' ms')); add('QTc Fridericia', fmt(results.qtcF, 0, ' ms'))
+      if (axis.deg != null) lines.push(`Axis ${Math.round(axis.deg)}°`)
+      for (const r of stRows) lines.push(`${r.lead} ST ${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`)
+      const r = vp.getBoundingClientRect()
+      await exportView({ img: el, svg, w: img.w, h: img.h, view, vpW: r.width, vpH: r.height, lines })
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === 'AbortError')) setErr(e instanceof Error ? e.message : 'Export failed')
+    } finally { setBusy(null) }
   }
 
   // ---------- calipers ----------
@@ -339,7 +388,9 @@ export default function App() {
     )
   }
 
-  const status = placing?.lead
+  const status = busy ? busy : calStep?.axis === 'quad'
+    ? `Straighten: tap the 4 corners of a block of grid boxes (${calStep.pts.length} of 4). A bigger block is more accurate.`
+    : placing?.lead
     ? `${placing.lead}: tap ${STEPS[placing.kind][placing.pts.length]}`
     : calStep
     ? `Calibrate ${calStep.axis === 'x' ? 'time (horizontal)' : 'voltage (vertical)'}: tap ${calStep.pts.length === 0 ? 'the first' : 'the second'} point across a known span of grid`
@@ -350,6 +401,7 @@ export default function App() {
       <header className="bar">
         <button className="btn ghost" onClick={() => { setImg(null); setCalStep(null) }}>New</button>
         <h1>ECG Calipers</h1>
+        <button className="btn ghost" onClick={() => setExporting(true)}>Share</button>
         <button className="btn ghost" onClick={() => setSheet(true)}>Results</button>
       </header>
 
@@ -443,12 +495,44 @@ export default function App() {
       )}
 
       <nav className="tools">
-        <button className="btn" onClick={() => setCalStep({ axis: 'x', pts: [] })}>Calibrate</button>
+        <button className="btn" onClick={() => setCalChoice(true)}>Calibrate</button>
         <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('time')}>⟷ Time</button>
         <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('amp')}>↕ Amp</button>
         <button className="btn ste" disabled={!!calStep} onClick={() => startPlacing('ste')}>STE</button>
         <button className="btn" disabled={!!calStep} onClick={() => startPlacing('axis')}>Axis</button>
       </nav>
+
+      {calChoice && (
+        <div className="sheet-bg" onClick={() => setCalChoice(false)}>
+          <div className="sheet" onClick={e => e.stopPropagation()}>
+            <h2>Calibrate</h2>
+            <button className="btn primary big" onClick={() => { setCalChoice(false); setCalStep({ axis: 'quad', pts: [] }) }}>
+              Straighten photo (4 corners)
+            </button>
+            <p className="fine">Best for camera photos taken at an angle. Tap the corners of a block of grid boxes; the photo is squared up and both axes are calibrated at once.</p>
+            <button className="btn big" onClick={() => { setCalChoice(false); setCalStep({ axis: 'x', pts: [] }) }}>
+              Quick (2 taps each way)
+            </button>
+            <p className="fine">Best for flat scans, PDFs and straight-on photos.</p>
+          </div>
+        </div>
+      )}
+
+      {quadPrompt && <QuadPrompt onDone={finishQuad} onCancel={() => setQuadPrompt(null)} />}
+
+      {exporting && (
+        <div className="sheet-bg" onClick={() => setExporting(false)}>
+          <div className="sheet" onClick={e => e.stopPropagation()}>
+            <h2>Check for patient identifiers</h2>
+            <p>Only what is on screen right now is exported. Zoom and pan so no patient name, date of birth, record number or other identifier is visible.</p>
+            <div className="row">
+              <button className="btn" onClick={() => setExporting(false)}>Go back and crop</button>
+              <span className="grow" />
+              <button className="btn primary" onClick={doExport}>Nothing identifying is visible, export</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {calPrompt && <CalPrompt axis={calPrompt.axis} onDone={finishCal} onCancel={() => setCalPrompt(null)} />}
 
@@ -638,6 +722,34 @@ function CalPrompt({ axis, onDone, onCancel }: { axis: 'x' | 'y'; onDone: (mm: n
           <button className="btn" onClick={onCancel}>Cancel</button>
           <span className="grow" />
           <button className="btn primary" onClick={() => onDone(mm)}>Set</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function QuadPrompt({ onDone, onCancel }: { onDone: (wMm: number, hMm: number) => void; onCancel: () => void }) {
+  const [w, setW] = useState(5)
+  const [h, setH] = useState(4)
+  const step = (v: number, d: number) => Math.max(1, v + d)
+  return (
+    <div className="sheet-bg">
+      <div className="sheet">
+        <h2>How big is the block you tapped?</h2>
+        <p className="fine">Count large boxes (5 mm each).</p>
+        <div className="row center">Wide
+          <button className="btn small" onClick={() => setW(v => step(v, -1))}>−</button><b className="num">{w}</b>
+          <button className="btn small" onClick={() => setW(v => step(v, 1))}>+</button>
+        </div>
+        <div className="row center">Tall
+          <button className="btn small" onClick={() => setH(v => step(v, -1))}>−</button><b className="num">{h}</b>
+          <button className="btn small" onClick={() => setH(v => step(v, 1))}>+</button>
+        </div>
+        <p className="fine">= {w * 5} × {h * 5} mm</p>
+        <div className="row">
+          <button className="btn" onClick={onCancel}>Cancel</button>
+          <span className="grow" />
+          <button className="btn primary" onClick={() => onDone(w * 5, h * 5)}>Straighten</button>
         </div>
       </div>
     </div>

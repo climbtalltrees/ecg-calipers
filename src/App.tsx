@@ -1,0 +1,491 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { PointerEvent as RPointerEvent } from 'react'
+import { loadFile, type LoadedImage } from './lib/loadImage'
+import {
+  pxPerMm, pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia,
+  type Calibration, type Point,
+} from './lib/measure'
+
+type TimeType = 'R-R' | 'PR' | 'QRS' | 'QT' | 'P wave' | 'Other'
+type AmpType = 'P amp' | 'R amp' | 'S amp' | 'Other'
+const TIME_TYPES: TimeType[] = ['R-R', 'PR', 'QRS', 'QT', 'P wave', 'Other']
+const AMP_TYPES: AmpType[] = ['P amp', 'R amp', 'S amp', 'Other']
+
+interface Caliper {
+  id: number
+  kind: 'time' | 'amp'
+  type: string
+  a: Point // first leg
+  b: Point // second leg
+  beats: number // R-R only: how many intervals the span covers
+  march: boolean
+}
+
+type CalStep = null | { axis: 'x' | 'y'; pts: Point[] }
+interface View { s: number; tx: number; ty: number }
+
+const COLORS: Record<string, string> = {
+  'R-R': '#2563eb', PR: '#7c3aed', QRS: '#db2777', QT: '#ea580c', 'P wave': '#059669',
+  'P amp': '#059669', 'R amp': '#db2777', 'S amp': '#0891b2', Other: '#475569',
+}
+
+let nextId = 1
+
+export default function App() {
+  const [img, setImg] = useState<LoadedImage | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [view, setView] = useState<View>({ s: 1, tx: 0, ty: 0 })
+  const [cal, setCal] = useState<Partial<Calibration>>({ paperSpeedMmPerS: 25, gainMmPerMv: 10 })
+  const [calStep, setCalStep] = useState<CalStep>(null)
+  const [calPrompt, setCalPrompt] = useState<null | { axis: 'x' | 'y'; pts: Point[] }>(null)
+  const [calipers, setCalipers] = useState<Caliper[]>([])
+  const [selected, setSelected] = useState<number | null>(null)
+  const [sheet, setSheet] = useState(false)
+
+  const vpRef = useRef<HTMLDivElement>(null)
+  const pointers = useRef(new Map<number, { x: number; y: number }>())
+  const gesture = useRef<{ startView: View; start: Map<number, { x: number; y: number }>; downAt: { x: number; y: number }; moved: boolean } | null>(null)
+  const drag = useRef<{ id: number; leg: 'a' | 'b' | 'bar'; last: Point } | null>(null)
+
+  const calibratedX = !!cal.pxPerMmX
+  const calibratedY = !!cal.pxPerMmY
+  const fullCal = cal as Calibration
+
+  // ---------- loading ----------
+  const onFile = async (file?: File) => {
+    if (!file) return
+    setErr(null)
+    try {
+      const loaded = await loadFile(file)
+      setImg(loaded)
+      setCalipers([])
+      setCal(c => ({ paperSpeedMmPerS: c.paperSpeedMmPerS, gainMmPerMv: c.gainMmPerMv }))
+      setCalStep({ axis: 'x', pts: [] })
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not open that file')
+    }
+  }
+
+  const fit = useCallback(() => {
+    const vp = vpRef.current
+    if (!vp || !img) return
+    const r = vp.getBoundingClientRect()
+    const s = Math.min(r.width / img.w, r.height / img.h)
+    setView({ s, tx: (r.width - img.w * s) / 2, ty: (r.height - img.h * s) / 2 })
+  }, [img])
+  useEffect(() => { fit() }, [fit])
+
+  // ---------- coordinates ----------
+  const toImage = (clientX: number, clientY: number): Point => {
+    const r = vpRef.current!.getBoundingClientRect()
+    return { x: (clientX - r.left - view.tx) / view.s, y: (clientY - r.top - view.ty) / view.s }
+  }
+
+  // ---------- pan / pinch / tap on the viewport ----------
+  const onVpDown = (e: RPointerEvent) => {
+    ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    gesture.current = {
+      startView: view,
+      start: new Map(pointers.current),
+      downAt: { x: e.clientX, y: e.clientY },
+      moved: pointers.current.size > 1,
+    }
+  }
+  const onVpMove = (e: RPointerEvent) => {
+    if (drag.current) return onHandleMove(e)
+    if (!pointers.current.has(e.pointerId) || !gesture.current) return
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    const g = gesture.current
+    const r = vpRef.current!.getBoundingClientRect()
+    const now = [...pointers.current.values()]
+    const was = [...g.start.values()]
+    if (Math.hypot(e.clientX - g.downAt.x, e.clientY - g.downAt.y) > 6) g.moved = true
+    if (now.length === 1 && was.length === 1) {
+      setView({ ...g.startView, tx: g.startView.tx + now[0].x - was[0].x, ty: g.startView.ty + now[0].y - was[0].y })
+    } else if (now.length >= 2 && was.length >= 2) {
+      const mid = (p: { x: number; y: number }[]) => ({ x: (p[0].x + p[1].x) / 2 - r.left, y: (p[0].y + p[1].y) / 2 - r.top })
+      const dist = (p: { x: number; y: number }[]) => Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1
+      const m0 = mid(was), m1 = mid(now)
+      const s = clamp(g.startView.s * (dist(now) / dist(was)), 0.05, 40)
+      const ix = (m0.x - g.startView.tx) / g.startView.s
+      const iy = (m0.y - g.startView.ty) / g.startView.s
+      setView({ s, tx: m1.x - ix * s, ty: m1.y - iy * s })
+    }
+  }
+  const onVpUp = (e: RPointerEvent) => {
+    if (drag.current) { drag.current = null; return }
+    const g = gesture.current
+    pointers.current.delete(e.pointerId)
+    if (g && !g.moved && pointers.current.size === 0) onTap(toImage(e.clientX, e.clientY))
+    if (pointers.current.size === 0) gesture.current = null
+    else gesture.current = { startView: view, start: new Map(pointers.current), downAt: { x: 0, y: 0 }, moved: true }
+  }
+  const onWheel = (e: React.WheelEvent) => {
+    const r = vpRef.current!.getBoundingClientRect()
+    const mx = e.clientX - r.left, my = e.clientY - r.top
+    const s = clamp(view.s * Math.exp(-e.deltaY * 0.0015), 0.05, 40)
+    const ix = (mx - view.tx) / view.s, iy = (my - view.ty) / view.s
+    setView({ s, tx: mx - ix * s, ty: my - iy * s })
+  }
+  const zoomBy = (f: number) => {
+    const r = vpRef.current!.getBoundingClientRect()
+    const mx = r.width / 2, my = r.height / 2
+    const s = clamp(view.s * f, 0.05, 40)
+    const ix = (mx - view.tx) / view.s, iy = (my - view.ty) / view.s
+    setView({ s, tx: mx - ix * s, ty: my - iy * s })
+  }
+
+  const onTap = (p: Point) => {
+    if (calStep) {
+      const pts = [...calStep.pts, p]
+      if (pts.length === 2) { setCalStep(null); setCalPrompt({ axis: calStep.axis, pts }) }
+      else setCalStep({ ...calStep, pts })
+      return
+    }
+    setSelected(null)
+  }
+
+  const finishCal = (knownMm: number) => {
+    if (!calPrompt) return
+    try {
+      const v = pxPerMm(calPrompt.pts[0], calPrompt.pts[1], calPrompt.axis, knownMm)
+      setCal(c => calPrompt.axis === 'x' ? { ...c, pxPerMmX: v } : { ...c, pxPerMmY: v })
+      const axis = calPrompt.axis
+      setCalPrompt(null)
+      if (axis === 'x' && !cal.pxPerMmY) setCalStep({ axis: 'y', pts: [] })
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Calibration failed')
+      setCalPrompt(null)
+    }
+  }
+
+  // ---------- calipers ----------
+  const viewCenter = (): Point => {
+    const r = vpRef.current!.getBoundingClientRect()
+    return toImage(r.left + r.width / 2, r.top + r.height / 2)
+  }
+  const addCaliper = (kind: 'time' | 'amp') => {
+    const c = viewCenter()
+    // Start one large box wide (5 mm) if calibrated, else a fixed screen size.
+    const half = kind === 'time'
+      ? (cal.pxPerMmX ? cal.pxPerMmX * 10 : 80 / view.s)
+      : (cal.pxPerMmY ? cal.pxPerMmY * 5 : 60 / view.s)
+    const cp: Caliper = kind === 'time'
+      ? { id: nextId++, kind, type: 'R-R', a: { x: c.x - half, y: c.y }, b: { x: c.x + half, y: c.y }, beats: 1, march: false }
+      : { id: nextId++, kind, type: 'R amp', a: { x: c.x, y: c.y - half }, b: { x: c.x, y: c.y + half }, beats: 1, march: false }
+    setCalipers(cs => [...cs, cp])
+    setSelected(cp.id)
+  }
+  const update = (id: number, patch: Partial<Caliper>) =>
+    setCalipers(cs => cs.map(c => (c.id === id ? { ...c, ...patch } : c)))
+  const remove = (id: number) => { setCalipers(cs => cs.filter(c => c.id !== id)); setSelected(null) }
+
+  const onHandleDown = (e: RPointerEvent, id: number, leg: 'a' | 'b' | 'bar') => {
+    e.stopPropagation()
+    vpRef.current!.setPointerCapture(e.pointerId)
+    drag.current = { id, leg, last: toImage(e.clientX, e.clientY) }
+    setSelected(id)
+  }
+  const onHandleMove = (e: RPointerEvent) => {
+    const d = drag.current!
+    const p = toImage(e.clientX, e.clientY)
+    const dx = p.x - d.last.x, dy = p.y - d.last.y
+    d.last = p
+    setCalipers(cs => cs.map(c => {
+      if (c.id !== d.id) return c
+      const mv = (q: Point) => ({ x: q.x + dx, y: q.y + dy })
+      if (d.leg === 'bar') return { ...c, a: mv(c.a), b: mv(c.b) }
+      // Legs slide along their measuring axis; the bar position follows the drag.
+      if (c.kind === 'time') {
+        const a = d.leg === 'a' ? { x: c.a.x + dx, y: c.a.y + dy } : { ...c.a, y: c.a.y + dy }
+        const b = d.leg === 'b' ? { x: c.b.x + dx, y: c.b.y + dy } : { ...c.b, y: c.b.y + dy }
+        return { ...c, a, b }
+      }
+      const a = d.leg === 'a' ? { x: c.a.x + dx, y: c.a.y + dy } : { ...c.a, x: c.a.x + dx }
+      const b = d.leg === 'b' ? { x: c.b.x + dx, y: c.b.y + dy } : { ...c.b, x: c.b.x + dx }
+      return { ...c, a, b }
+    }))
+  }
+
+  // ---------- results ----------
+  const valueOf = useCallback((c: Caliper): number | null => {
+    if (c.kind === 'time') return calibratedX ? pxToMs(c.b.x - c.a.x, fullCal) : null
+    return calibratedY ? pxToMv(c.b.y - c.a.y, fullCal) : null
+  }, [calibratedX, calibratedY, fullCal])
+
+  const results = useMemo(() => {
+    const latest = (t: string) => [...calipers].reverse().find(c => c.type === t)
+    const val = (t: string) => { const c = latest(t); return c ? valueOf(c) : null }
+    const rrC = latest('R-R')
+    const rrMs = rrC && calibratedX ? pxToMs(rrC.b.x - rrC.a.x, fullCal) / rrC.beats : null
+    const qt = val('QT')
+    const r = val('R amp'), s = val('S amp')
+    return {
+      rate: rrMs ? rateFromSpan(rrMs) : null,
+      rrMs,
+      pr: val('PR'), qrs: val('QRS'), qt, pw: val('P wave'),
+      qtcB: qt && rrMs ? qtcBazett(qt, rrMs) : null,
+      qtcF: qt && rrMs ? qtcFridericia(qt, rrMs) : null,
+      pAmp: val('P amp'), rAmp: r, sAmp: s,
+      rs: r && s ? r / s : null,
+    }
+  }, [calipers, valueOf, calibratedX, fullCal])
+
+  const sel = calipers.find(c => c.id === selected) || null
+  const hs = 1 / view.s // keeps handles a constant size on screen
+
+  // ---------- render ----------
+  if (!img) {
+    return (
+      <div className="app">
+        <header className="bar"><h1>ECG Calipers</h1></header>
+        <main className="welcome">
+          <p className="lead">Measure a real ECG with calipers you place yourself.</p>
+          <label className="btn primary big">
+            Take a photo
+            <input type="file" accept="image/*" capture="environment" hidden onChange={e => onFile(e.target.files?.[0])} />
+          </label>
+          <label className="btn big">
+            Open an image or PDF
+            <input type="file" accept="image/*,application/pdf" hidden onChange={e => onFile(e.target.files?.[0])} />
+          </label>
+          {err && <p className="err">{err}</p>}
+          <p className="fine">Your ECG never leaves this device. Before you share an export, crop out any patient name, date of birth or record number.</p>
+          <p className="fine">A measurement aid for trained providers. You place every point; the app does not find waves or interpret rhythms.</p>
+        </main>
+      </div>
+    )
+  }
+
+  const status = calStep
+    ? `Calibrate ${calStep.axis === 'x' ? 'time (horizontal)' : 'voltage (vertical)'}: tap ${calStep.pts.length === 0 ? 'the first' : 'the second'} point across a known span of grid`
+    : !calibratedX ? 'Calibrate time to see measurements' : null
+
+  return (
+    <div className="app">
+      <header className="bar">
+        <button className="btn ghost" onClick={() => { setImg(null); setCalStep(null) }}>New</button>
+        <h1>ECG Calipers</h1>
+        <button className="btn ghost" onClick={() => setSheet(true)}>Results</button>
+      </header>
+
+      {status && <div className="status">{status}{calStep && <button className="link" onClick={() => setCalStep(null)}>Cancel</button>}</div>}
+      {err && <div className="status err" onClick={() => setErr(null)}>{err} (tap to dismiss)</div>}
+
+      <div
+        className="viewport"
+        ref={vpRef}
+        onPointerDown={onVpDown}
+        onPointerMove={onVpMove}
+        onPointerUp={onVpUp}
+        onPointerCancel={onVpUp}
+        onWheel={onWheel}
+      >
+        <div className="stage" style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`, width: img.w, height: img.h }}>
+          <img src={img.src} width={img.w} height={img.h} draggable={false} alt="ECG" />
+          <svg className="overlay" width={img.w} height={img.h} viewBox={`0 0 ${img.w} ${img.h}`}>
+            {(calStep?.pts ?? calPrompt?.pts ?? []).map((p, i) => (
+              <circle key={i} cx={p.x} cy={p.y} r={7 * hs} className="calpt" />
+            ))}
+            {calipers.map(c => (
+              <CaliperShape key={c.id} c={c} hs={hs} h={img.h} w={img.w} selected={c.id === selected}
+                label={labelFor(c, valueOf(c))} onDown={onHandleDown} />
+            ))}
+          </svg>
+        </div>
+        <div className="zoom">
+          <button className="btn round" onClick={() => zoomBy(1.4)} aria-label="Zoom in">+</button>
+          <button className="btn round" onClick={() => zoomBy(1 / 1.4)} aria-label="Zoom out">−</button>
+          <button className="btn round" onClick={fit} aria-label="Fit">⤢</button>
+        </div>
+      </div>
+
+      {sel && (
+        <div className="panel">
+          <div className="chips">
+            {(sel.kind === 'time' ? TIME_TYPES : AMP_TYPES).map(t => (
+              <button key={t} className={`chip ${sel.type === t ? 'on' : ''}`} style={{ '--c': COLORS[t] } as React.CSSProperties}
+                onClick={() => update(sel.id, { type: t })}>{t}</button>
+            ))}
+          </div>
+          <div className="row">
+            {sel.type === 'R-R' && (
+              <label className="beats">Spans
+                <button className="btn small" onClick={() => update(sel.id, { beats: Math.max(1, sel.beats - 1) })}>−</button>
+                <b>{sel.beats}</b>
+                <button className="btn small" onClick={() => update(sel.id, { beats: sel.beats + 1 })}>+</button>
+                {sel.beats === 1 ? 'beat' : 'beats'}
+              </label>
+            )}
+            {sel.kind === 'time' && (
+              <button className={`btn small ${sel.march ? 'primary' : ''}`} onClick={() => update(sel.id, { march: !sel.march })}>March out</button>
+            )}
+            <span className="grow" />
+            <button className="btn small danger" onClick={() => remove(sel.id)}>Delete</button>
+          </div>
+        </div>
+      )}
+
+      <nav className="tools">
+        <button className="btn" onClick={() => setCalStep({ axis: 'x', pts: [] })}>Calibrate</button>
+        <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('time')}>⟷ Time</button>
+        <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('amp')}>↕ Amplitude</button>
+      </nav>
+
+      {calPrompt && <CalPrompt axis={calPrompt.axis} onDone={finishCal} onCancel={() => setCalPrompt(null)} />}
+
+      {sheet && (
+        <div className="sheet-bg" onClick={() => setSheet(false)}>
+          <div className="sheet" onClick={e => e.stopPropagation()}>
+            <h2>Measurements</h2>
+            <Settings cal={cal} setCal={setCal} />
+            <table>
+              <tbody>
+                <Row k="Heart rate" v={fmt(results.rate, 0, '/min')} sub={results.rrMs ? `R-R ${fmt(results.rrMs, 0, ' ms')}` : undefined} />
+                <Row k="PR" v={fmt(results.pr, 0, ' ms')} />
+                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} />
+                <Row k="QT" v={fmt(results.qt, 0, ' ms')} />
+                <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} />
+                <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} />
+                <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} />
+                <Row k="P amplitude" v={fmt(results.pAmp, 2, ' mV')} />
+                <Row k="R amplitude" v={fmt(results.rAmp, 2, ' mV')} />
+                <Row k="S amplitude" v={fmt(results.sAmp, 2, ' mV')} />
+                <Row k="R:S ratio" v={fmt(results.rs, 2, '')} />
+              </tbody>
+            </table>
+            <p className="fine">Values come only from calipers you placed. QTc needs an R-R and a QT caliper. Normal-range flags will be added once each limit is checked against its cited guideline.</p>
+            <button className="btn primary" onClick={() => setSheet(false)}>Done</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
+  c: Caliper; hs: number; w: number; h: number; selected: boolean; label: string
+  onDown: (e: RPointerEvent, id: number, leg: 'a' | 'b' | 'bar') => void
+}) {
+  const col = COLORS[c.type] ?? COLORS.Other
+  const sw = (selected ? 2.5 : 1.75) * hs
+  const grab = 22 * hs // generous invisible touch target
+  if (c.kind === 'time') {
+    const y = c.a.y
+    const span = c.b.x - c.a.x
+    const marks: number[] = []
+    if (c.march && Math.abs(span) > 2 * hs) {
+      for (let x = c.b.x + span; x > 0 && x < w; x += span) marks.push(x)
+      for (let x = c.a.x - span; x > 0 && x < w; x -= span) marks.push(x)
+    }
+    return (
+      <g style={{ color: col }}>
+        {marks.map((x, i) => <line key={i} x1={x} x2={x} y1={0} y2={h} stroke={col} strokeWidth={1.25 * hs} strokeDasharray={`${6 * hs} ${5 * hs}`} opacity={0.75} />)}
+        <line x1={c.a.x} x2={c.a.x} y1={0} y2={h} stroke={col} strokeWidth={sw} />
+        <line x1={c.b.x} x2={c.b.x} y1={0} y2={h} stroke={col} strokeWidth={sw} />
+        <line x1={c.a.x} x2={c.b.x} y1={y} y2={y} stroke={col} strokeWidth={sw} />
+        <line x1={c.a.x} x2={c.b.x} y1={y} y2={y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'bar')} className="grab" />
+        <line x1={c.a.x} x2={c.a.x} y1={0} y2={h} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'a')} className="grab ew" />
+        <line x1={c.b.x} x2={c.b.x} y1={0} y2={h} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'b')} className="grab ew" />
+        <circle cx={c.a.x} cy={y} r={6 * hs} fill={col} />
+        <circle cx={c.b.x} cy={y} r={6 * hs} fill={col} />
+        <Tag x={(c.a.x + c.b.x) / 2} y={y - 12 * hs} hs={hs} text={label} col={col} />
+      </g>
+    )
+  }
+  const x = c.a.x
+  return (
+    <g>
+      <line x1={0} x2={w} y1={c.a.y} y2={c.a.y} stroke={col} strokeWidth={sw} />
+      <line x1={0} x2={w} y1={c.b.y} y2={c.b.y} stroke={col} strokeWidth={sw} />
+      <line x1={x} x2={x} y1={c.a.y} y2={c.b.y} stroke={col} strokeWidth={sw} />
+      <line x1={x} x2={x} y1={c.a.y} y2={c.b.y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'bar')} className="grab" />
+      <line x1={0} x2={w} y1={c.a.y} y2={c.a.y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'a')} className="grab ns" />
+      <line x1={0} x2={w} y1={c.b.y} y2={c.b.y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'b')} className="grab ns" />
+      <circle cx={x} cy={c.a.y} r={6 * hs} fill={col} />
+      <circle cx={x} cy={c.b.y} r={6 * hs} fill={col} />
+      <Tag x={x + 10 * hs} y={(c.a.y + c.b.y) / 2} hs={hs} text={label} col={col} anchor="start" />
+    </g>
+  )
+}
+
+function Tag({ x, y, hs, text, col, anchor = 'middle' }: { x: number; y: number; hs: number; text: string; col: string; anchor?: 'middle' | 'start' }) {
+  const fs = 14 * hs
+  const wpx = text.length * fs * 0.6 + 10 * hs
+  const left = anchor === 'middle' ? x - wpx / 2 : x
+  return (
+    <g pointerEvents="none">
+      <rect x={left} y={y - fs} width={wpx} height={fs * 1.4} rx={4 * hs} fill="white" stroke={col} strokeWidth={hs} />
+      <text x={left + wpx / 2} y={y} fontSize={fs} textAnchor="middle" fill={col} fontWeight={600}>{text}</text>
+    </g>
+  )
+}
+
+function CalPrompt({ axis, onDone, onCancel }: { axis: 'x' | 'y'; onDone: (mm: number) => void; onCancel: () => void }) {
+  const [boxes, setBoxes] = useState(axis === 'x' ? 5 : 2)
+  const [size, setSize] = useState<'large' | 'small'>('large')
+  const mm = boxes * (size === 'large' ? 5 : 1)
+  return (
+    <div className="sheet-bg">
+      <div className="sheet">
+        <h2>How far apart were your taps?</h2>
+        <p>{axis === 'x' ? 'Horizontal' : 'Vertical'} distance between the two points:</p>
+        <div className="row center">
+          <button className="btn small" onClick={() => setBoxes(b => Math.max(1, b - 1))}>−</button>
+          <b className="num">{boxes}</b>
+          <button className="btn small" onClick={() => setBoxes(b => b + 1)}>+</button>
+          <select value={size} onChange={e => setSize(e.target.value as 'large' | 'small')}>
+            <option value="large">large boxes (5 mm)</option>
+            <option value="small">small boxes (1 mm)</option>
+          </select>
+        </div>
+        <p className="fine">= {mm} mm. Spanning more boxes gives a more accurate calibration.</p>
+        <div className="row">
+          <button className="btn" onClick={onCancel}>Cancel</button>
+          <span className="grow" />
+          <button className="btn primary" onClick={() => onDone(mm)}>Set</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Settings({ cal, setCal }: { cal: Partial<Calibration>; setCal: (f: (c: Partial<Calibration>) => Partial<Calibration>) => void }) {
+  return (
+    <div className="row settings">
+      <label>Paper speed
+        <select value={cal.paperSpeedMmPerS} onChange={e => setCal(c => ({ ...c, paperSpeedMmPerS: Number(e.target.value) }))}>
+          <option value={25}>25 mm/s</option>
+          <option value={50}>50 mm/s</option>
+        </select>
+      </label>
+      <label>Gain
+        <select value={cal.gainMmPerMv} onChange={e => setCal(c => ({ ...c, gainMmPerMv: Number(e.target.value) }))}>
+          <option value={5}>5 mm/mV</option>
+          <option value={10}>10 mm/mV</option>
+          <option value={20}>20 mm/mV</option>
+        </select>
+      </label>
+    </div>
+  )
+}
+
+function Row({ k, v, sub }: { k: string; v: string; sub?: string }) {
+  return <tr><th>{k}{sub && <small>{sub}</small>}</th><td>{v}</td></tr>
+}
+
+function labelFor(c: Caliper, v: number | null): string {
+  if (v == null) return c.type
+  if (c.kind === 'amp') return `${c.type} ${v.toFixed(2)} mV`
+  if (c.type === 'R-R') {
+    const per = v / c.beats
+    return `${Math.round(rateFromSpan(per))}/min${c.beats > 1 ? ` (${c.beats})` : ''}`
+  }
+  return `${c.type} ${Math.round(v)} ms`
+}
+
+function fmt(v: number | null, dp: number, unit: string) {
+  return v == null || !isFinite(v) ? '—' : `${v.toFixed(dp)}${unit}`
+}
+function clamp(v: number, lo: number, hi: number) { return Math.min(hi, Math.max(lo, v)) }

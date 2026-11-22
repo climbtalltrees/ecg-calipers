@@ -40,7 +40,7 @@ export async function exportView({ img, svg, w, h, view, vpW, vpH, lines }: Args
   ctx.fillStyle = '#0f172a'; ctx.font = '600 14px system-ui, sans-serif'
   lines.forEach((l, i) => ctx.fillText(l, pad + (i % 2) * (vpW / 2), vpH + pad + 14 + Math.floor(i / 2) * lineH))
   ctx.fillStyle = '#64748b'; ctx.font = '12px system-ui, sans-serif'
-  ctx.fillText('ECG Calipers · all points placed by the user · not a diagnosis', pad, vpH + footer - pad)
+  ctx.fillText('ECGs Made Easy · all points placed by the user · not a diagnosis', pad, vpH + footer - pad)
   const blob: Blob = await new Promise((r, j) => c.toBlob(b => (b ? r(b) : j(new Error('Export failed'))), 'image/png'))
   const file = new File([blob], `ecg-measured-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.png`, { type: 'image/png' })
   if (navigator.canShare?.({ files: [file] })) {

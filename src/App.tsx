@@ -3,62 +3,48 @@ import type { PointerEvent as RPointerEvent } from 'react'
 import { loadFile, type LoadedImage } from './lib/loadImage'
 import { straighten } from './lib/warp'
 import { exportView } from './lib/exportView'
-import {
-  pxPerMm, pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia,
-  type Calibration, type Point,
-} from './lib/measure'
+import { drawDemo } from './lib/demo'
+import { isSquareOn, scaleFromBox, squareAt, type Quad } from './lib/calbox'
+import { pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia, type Calibration, type Point } from './lib/measure'
 import { qrsFlag, qtcFlag, stFlag, axisFlag, type Flag, type Patient } from './lib/flags'
 import { REFS, RULES } from './lib/references'
 import { LEADS, stDeviationMm, heightMm, netQrsMm, frontalAxis, type Lead } from './lib/leads'
+import { CaliperShape, MarkerShape, CalBoxShape, StepDiagram, COLORS, type Caliper, type Marker } from './components/shapes'
+import { Intro, TOUR } from './components/Intro'
 
-type TimeType = 'R-R' | 'PR' | 'QRS' | 'QT' | 'P wave' | 'Other'
-type AmpType = 'P amp' | 'R amp' | 'S amp' | 'Other'
-const TIME_TYPES: TimeType[] = ['R-R', 'PR', 'QRS', 'QT', 'P wave', 'Other']
-const AMP_TYPES: AmpType[] = ['P amp', 'R amp', 'S amp', 'Other']
+const TIME_TYPES = ['R-R', 'PR', 'QRS', 'QT', 'P wave', 'Other']
+const AMP_TYPES = ['P amp', 'R amp', 'S amp', 'Other']
 
-interface Caliper {
-  id: number
-  kind: 'time' | 'amp'
-  type: string
-  a: Point // first leg
-  b: Point // second leg
-  beats: number // R-R only: how many intervals the span covers
-  march: boolean
-}
-
-/** User-tapped points on one lead. STE: base, j, peak?. Axis: base, r, s. */
-interface Marker {
-  id: number
-  kind: 'ste' | 'axis'
-  lead: Lead
-  pts: Point[]
-}
 type Placing = null | { kind: 'ste' | 'axis'; lead: Lead | null; pts: Point[] }
 const STEPS: Record<'ste' | 'axis', string[]> = {
-  ste: ['the baseline (TP or PR segment)', 'the J point', 'the tallest point of the QRS (for the ST:QRS ratio)'],
-  axis: ['the baseline', 'the top of the R wave', 'the bottom of the S wave'],
+  ste: ['Tap the baseline: a flat spot on the TP or PR segment.', 'Tap the J point: where the QRS ends and the ST segment begins.', 'Tap the tallest point of the QRS (for the ST:QRS ratio).'],
+  axis: ['Tap the baseline: a flat spot before the QRS.', 'Tap the top of the R wave.', 'Tap the bottom of the S wave.'],
 }
 const AXIS_LEADS: Lead[] = ['I', 'aVF', 'II']
 
-type CalStep = null | { axis: 'x' | 'y' | 'quad'; pts: Point[] }
 interface View { s: number; tx: number; ty: number }
-
-const COLORS: Record<string, string> = {
-  'R-R': '#2563eb', PR: '#7c3aed', QRS: '#db2777', QT: '#ea580c', 'P wave': '#059669',
-  'P amp': '#059669', 'R amp': '#db2777', 'S amp': '#0891b2', Other: '#475569',
-}
+interface CalBox { q: Quad; wBoxes: number; hBoxes: number }
+type Drag =
+  | { kind: 'caliper'; id: number; leg: 'a' | 'b' | 'bar'; last: Point }
+  | { kind: 'marker'; id: number; idx: number; last: Point }
+  | { kind: 'box'; corner: number | 'move'; last: Point }
 
 let nextId = 1
+
+function introSeen(): boolean {
+  try { return localStorage.getItem('introSeen') === '1' } catch { return false }
+}
+function markIntroSeen() {
+  try { localStorage.setItem('introSeen', '1') } catch { /* private mode: fine */ }
+}
 
 export default function App() {
   const [img, setImg] = useState<LoadedImage | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [view, setView] = useState<View>({ s: 1, tx: 0, ty: 0 })
   const [cal, setCal] = useState<Partial<Calibration>>({ paperSpeedMmPerS: 25, gainMmPerMv: 10 })
-  const [calStep, setCalStep] = useState<CalStep>(null)
-  const [calPrompt, setCalPrompt] = useState<null | { axis: 'x' | 'y'; pts: Point[] }>(null)
-  const [calChoice, setCalChoice] = useState(false)
-  const [quadPrompt, setQuadPrompt] = useState<Point[] | null>(null)
+  const [calBox, setCalBox] = useState<CalBox | null>(null)
+  const [lastBox, setLastBox] = useState<CalBox | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
   const [calipers, setCalipers] = useState<Caliper[]>([])
@@ -68,32 +54,41 @@ export default function App() {
   const [placing, setPlacing] = useState<Placing>(null)
   const [selMarker, setSelMarker] = useState<number | null>(null)
   const [patient, setPatient] = useState<Patient>({ sex: 'unset', age: 'unset' })
+  const [showIntro, setShowIntro] = useState(() => !introSeen())
+  const [tour, setTour] = useState<number | null>(null)
 
   const vpRef = useRef<HTMLDivElement>(null)
   const pointers = useRef(new Map<number, { x: number; y: number }>())
   const gesture = useRef<{ startView: View; start: Map<number, { x: number; y: number }>; downAt: { x: number; y: number }; moved: boolean } | null>(null)
-  const drag = useRef<{ id: number; leg: 'a' | 'b' | 'bar'; last: Point } | { marker: number; idx: number; last: Point } | null>(null)
+  const drag = useRef<Drag | null>(null)
+  const viewRef = useRef(view)
+  viewRef.current = view
 
   const calibratedX = !!cal.pxPerMmX
   const calibratedY = !!cal.pxPerMmY
   const fullCal = cal as Calibration
 
   // ---------- loading ----------
+  const resetFor = (loaded: LoadedImage) => {
+    setImg(loaded)
+    setCalipers([]); setMarkers([]); setPlacing(null); setSelected(null); setSelMarker(null)
+    setCal(c => ({ paperSpeedMmPerS: c.paperSpeedMmPerS, gainMmPerMv: c.gainMmPerMv }))
+    setLastBox(null)
+    setCalBox(null)
+    pendingBox.current = true
+  }
+  const pendingBox = useRef(false)
+
   const onFile = async (file?: File) => {
     if (!file) return
     setErr(null)
-    try {
-      const loaded = await loadFile(file)
-      setImg(loaded)
-      setCalipers([])
-      setMarkers([])
-      setPlacing(null)
-      setCal(c => ({ paperSpeedMmPerS: c.paperSpeedMmPerS, gainMmPerMv: c.gainMmPerMv }))
-      setCalStep(null)
-      setCalChoice(true)
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Could not open that file')
-    }
+    try { resetFor(await loadFile(file)); setTour(null) } catch (e) { setErr(e instanceof Error ? e.message : 'Could not open that file') }
+  }
+  const loadDemo = async () => {
+    markIntroSeen(); setShowIntro(false)
+    const d = await drawDemo()
+    resetFor({ ...d, name: 'Practice strip' })
+    setTour(0)
   }
 
   const fit = useCallback(() => {
@@ -108,207 +103,200 @@ export default function App() {
   // ---------- coordinates ----------
   const toImage = (clientX: number, clientY: number): Point => {
     const r = vpRef.current!.getBoundingClientRect()
-    return { x: (clientX - r.left - view.tx) / view.s, y: (clientY - r.top - view.ty) / view.s }
+    const v = viewRef.current
+    return { x: (clientX - r.left - v.tx) / v.s, y: (clientY - r.top - v.ty) / v.s }
+  }
+  const viewCenter = (): Point => {
+    const r = vpRef.current!.getBoundingClientRect()
+    return toImage(r.left + r.width / 2, r.top + r.height / 2)
   }
 
-  // ---------- pan / pinch / tap on the viewport ----------
+  // ---------- calibration box ----------
+  const openCalBox = () => {
+    setPlacing(null); setSelected(null); setSelMarker(null)
+    if (lastBox) { setCalBox(lastBox); return }
+    const r = vpRef.current!.getBoundingClientRect()
+    const half = cal.pxPerMmX ? cal.pxPerMmX * 2.5 : Math.min(r.width, r.height) / 10 / viewRef.current.s
+    setCalBox({ q: squareAt(viewCenter(), half), wBoxes: 1, hBoxes: 1 })
+  }
+  // Open the box once the new image has been fitted, so it lands in view.
+  useEffect(() => {
+    if (img && pendingBox.current) { pendingBox.current = false; requestAnimationFrame(() => requestAnimationFrame(openCalBox)) }
+  })
+
+  const lockCal = async () => {
+    if (!calBox || !img) return
+    const wMm = calBox.wBoxes * 5, hMm = calBox.hBoxes * 5
+    if (isSquareOn(calBox.q)) {
+      const s = scaleFromBox(calBox.q, wMm, hMm)
+      setCal(c => ({ ...c, pxPerMmX: s.x, pxPerMmY: s.y }))
+      setLastBox(calBox)
+      setCalBox(null)
+      if (tour === 0) setTour(1)
+      return
+    }
+    // The box is skewed: the photo was taken at an angle, so square it up.
+    const q = calBox.q
+    setCalBox(null)
+    setBusy('Photo is at an angle: straightening it…')
+    try {
+      await new Promise(r => setTimeout(r, 30))
+      const out = await straighten(img.src, q, wMm, hMm)
+      setImg({ ...img, src: out.src, w: out.w, h: out.h })
+      setCal(c => ({ ...c, pxPerMmX: out.pxPerMm, pxPerMmY: out.pxPerMm }))
+      setCalipers([]); setMarkers([]); setSelected(null); setSelMarker(null)
+      setLastBox(null)
+      if (tour === 0) setTour(1)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not straighten that photo')
+    } finally { setBusy(null) }
+  }
+
+  // ---------- pan / pinch / tap ----------
   const onVpDown = (e: RPointerEvent) => {
+    // A primary pointer means no other finger is down: drop any stale entries.
+    if (e.isPrimary) pointers.current.clear()
     ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
-    gesture.current = {
-      startView: view,
-      start: new Map(pointers.current),
-      downAt: { x: e.clientX, y: e.clientY },
-      moved: pointers.current.size > 1,
-    }
+    gesture.current = { startView: view, start: new Map(pointers.current), downAt: { x: e.clientX, y: e.clientY }, moved: pointers.current.size > 1 }
   }
   const onVpMove = (e: RPointerEvent) => {
-    if (drag.current) return onHandleMove(e)
+    if (drag.current) return onDragMove(e)
     if (!pointers.current.has(e.pointerId) || !gesture.current) return
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     const g = gesture.current
     const r = vpRef.current!.getBoundingClientRect()
     const now = [...pointers.current.values()]
     const was = [...g.start.values()]
-    if (Math.hypot(e.clientX - g.downAt.x, e.clientY - g.downAt.y) > 6) g.moved = true
+    if (Math.hypot(e.clientX - g.downAt.x, e.clientY - g.downAt.y) > 8) g.moved = true
     if (now.length === 1 && was.length === 1) {
-      setView({ ...g.startView, tx: g.startView.tx + now[0].x - was[0].x, ty: g.startView.ty + now[0].y - was[0].y })
+      if (g.moved) setView({ ...g.startView, tx: g.startView.tx + now[0].x - was[0].x, ty: g.startView.ty + now[0].y - was[0].y })
     } else if (now.length >= 2 && was.length >= 2) {
       const mid = (p: { x: number; y: number }[]) => ({ x: (p[0].x + p[1].x) / 2 - r.left, y: (p[0].y + p[1].y) / 2 - r.top })
       const dist = (p: { x: number; y: number }[]) => Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1
       const m0 = mid(was), m1 = mid(now)
       const s = clamp(g.startView.s * (dist(now) / dist(was)), 0.05, 40)
-      const ix = (m0.x - g.startView.tx) / g.startView.s
-      const iy = (m0.y - g.startView.ty) / g.startView.s
+      const ix = (m0.x - g.startView.tx) / g.startView.s, iy = (m0.y - g.startView.ty) / g.startView.s
       setView({ s, tx: m1.x - ix * s, ty: m1.y - iy * s })
     }
   }
   const onVpUp = (e: RPointerEvent) => {
-    if (drag.current) { drag.current = null; return }
-    const g = gesture.current
     pointers.current.delete(e.pointerId)
-    if (g && !g.moved && pointers.current.size === 0) onTap(toImage(e.clientX, e.clientY))
+    if (drag.current) { drag.current = null; gesture.current = null; return }
+    const g = gesture.current
+    if (g && !g.moved && pointers.current.size === 0 && e.type === 'pointerup') onTap(toImage(e.clientX, e.clientY))
     if (pointers.current.size === 0) gesture.current = null
     else gesture.current = { startView: view, start: new Map(pointers.current), downAt: { x: 0, y: 0 }, moved: true }
   }
-  const onWheel = (e: React.WheelEvent) => {
-    const r = vpRef.current!.getBoundingClientRect()
-    const mx = e.clientX - r.left, my = e.clientY - r.top
-    const s = clamp(view.s * Math.exp(-e.deltaY * 0.0015), 0.05, 40)
-    const ix = (mx - view.tx) / view.s, iy = (my - view.ty) / view.s
-    setView({ s, tx: mx - ix * s, ty: my - iy * s })
-  }
-  const zoomBy = (f: number) => {
-    const r = vpRef.current!.getBoundingClientRect()
-    const mx = r.width / 2, my = r.height / 2
+  const zoomAt = (mx: number, my: number, f: number) => {
     const s = clamp(view.s * f, 0.05, 40)
     const ix = (mx - view.tx) / view.s, iy = (my - view.ty) / view.s
     setView({ s, tx: mx - ix * s, ty: my - iy * s })
   }
+  const onWheel = (e: React.WheelEvent) => {
+    const r = vpRef.current!.getBoundingClientRect()
+    zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015))
+  }
+  const zoomBy = (f: number) => {
+    const r = vpRef.current!.getBoundingClientRect()
+    zoomAt(r.width / 2, r.height / 2, f)
+  }
 
   const onTap = (p: Point) => {
-    if (calStep) {
-      const pts = [...calStep.pts, p]
-      if (calStep.axis === 'quad') {
-        if (pts.length === 4) { setCalStep(null); setQuadPrompt(pts) }
-        else setCalStep({ ...calStep, pts })
-        return
-      }
-      if (pts.length === 2) { setCalStep(null); setCalPrompt({ axis: calStep.axis, pts }) }
-      else setCalStep({ ...calStep, pts })
-      return
-    }
-    if (placing && placing.lead) {
+    if (placing?.lead) {
       const pts = [...placing.pts, p]
       if (pts.length === 3) commitPlacing(pts)
       else setPlacing({ ...placing, pts })
       return
     }
-    setSelected(null)
-    setSelMarker(null)
+    setSelected(null); setSelMarker(null)
   }
 
+  // ---------- STE / axis placement ----------
+  const nextAxisLead = (ms: Marker[]): Lead | null => {
+    const done = new Set(ms.filter(m => m.kind === 'axis').map(m => m.lead))
+    return !done.has('I') ? 'I' : !done.has('aVF') ? 'aVF' : null
+  }
+  const startPlacing = (kind: 'ste' | 'axis') => {
+    if (!cal.pxPerMmY) { setErr('Calibrate first: fit the yellow box to one large square and tap Lock.'); openCalBox(); return }
+    setCalBox(null); setSelected(null); setSelMarker(null)
+    setPlacing({ kind, lead: kind === 'axis' ? nextAxisLead(markers) : null, pts: [] })
+  }
   const commitPlacing = (pts: Point[]) => {
     if (!placing?.lead) return
-    const lead = placing.lead
-    const kind = placing.kind
+    const { lead, kind } = placing
     const m: Marker = { id: nextId++, kind, lead, pts }
-    // One marker per lead per tool: re-measuring a lead replaces it.
-    setMarkers(ms => [...ms.filter(x => !(x.kind === kind && x.lead === lead)), m])
-    setPlacing(null)
+    const ms = [...markers.filter(x => !(x.kind === kind && x.lead === lead)), m]
+    setMarkers(ms)
     setSelMarker(m.id)
-    setSelected(null)
-  }
-
-  const finishCal = (knownMm: number) => {
-    if (!calPrompt) return
-    try {
-      const v = pxPerMm(calPrompt.pts[0], calPrompt.pts[1], calPrompt.axis, knownMm)
-      setCal(c => calPrompt.axis === 'x' ? { ...c, pxPerMmX: v } : { ...c, pxPerMmY: v })
-      const axis = calPrompt.axis
-      setCalPrompt(null)
-      if (axis === 'x' && !cal.pxPerMmY) setCalStep({ axis: 'y', pts: [] })
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Calibration failed')
-      setCalPrompt(null)
+    if (kind === 'axis') {
+      const next = nextAxisLead(ms)
+      setPlacing(next ? { kind, lead: next, pts: [] } : null)
+      if (!next && tour === 5) setSheet(true)
+    } else {
+      setPlacing({ kind, lead: null, pts: [] }) // back to the lead list for the next lead
+      if (tour === 4) setTour(5)
     }
   }
-
-  const finishQuad = async (wMm: number, hMm: number) => {
-    if (!quadPrompt || !img) return
-    const taps = quadPrompt
-    setQuadPrompt(null)
-    setBusy('Straightening photo…')
-    try {
-      // Let the busy banner paint before the heavy pixel loop.
-      await new Promise(r => setTimeout(r, 30))
-      const out = await straighten(img.src, taps, wMm, hMm)
-      setImg({ ...img, src: out.src, w: out.w, h: out.h })
-      setCal(c => ({ ...c, pxPerMmX: out.pxPerMm, pxPerMmY: out.pxPerMm }))
-      setCalipers([]); setMarkers([]); setSelected(null); setSelMarker(null)
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Could not straighten that photo')
-    } finally { setBusy(null) }
-  }
-
-  const doExport = async () => {
-    setExporting(false)
-    const vp = vpRef.current, el = vp?.querySelector('.stage img') as HTMLImageElement | null, svg = vp?.querySelector('svg.overlay') as SVGSVGElement | null
-    if (!vp || !el || !svg || !img) return
-    setSelected(null); setSelMarker(null)
-    setBusy('Preparing export…')
-    try {
-      const lines: string[] = []
-      const add = (k: string, v: string) => { if (v !== '—') lines.push(`${k} ${v}`) }
-      add('Rate', fmt(results.rate, 0, '/min')); add('PR', fmt(results.pr, 0, ' ms')); add('QRS', fmt(results.qrs, 0, ' ms'))
-      add('QT', fmt(results.qt, 0, ' ms')); add('QTc Bazett', fmt(results.qtcB, 0, ' ms')); add('QTc Fridericia', fmt(results.qtcF, 0, ' ms'))
-      if (axis.deg != null) lines.push(`Axis ${Math.round(axis.deg)}°`)
-      for (const r of stRows) lines.push(`${r.lead} ST ${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`)
-      const r = vp.getBoundingClientRect()
-      await exportView({ img: el, svg, w: img.w, h: img.h, view, vpW: r.width, vpH: r.height, lines })
-    } catch (e) {
-      if (!(e instanceof DOMException && e.name === 'AbortError')) setErr(e instanceof Error ? e.message : 'Export failed')
-    } finally { setBusy(null) }
+  const skipLast = () => {
+    if (!placing?.lead || placing.pts.length !== 2) return
+    // STE: no QRS peak (no ratio). Axis: no S wave, so S depth is zero.
+    commitPlacing([...placing.pts, placing.kind === 'axis' ? placing.pts[0] : placing.pts[1]])
   }
 
   // ---------- calipers ----------
-  const viewCenter = (): Point => {
-    const r = vpRef.current!.getBoundingClientRect()
-    return toImage(r.left + r.width / 2, r.top + r.height / 2)
-  }
   const addCaliper = (kind: 'time' | 'amp') => {
+    setPlacing(null); setCalBox(null)
     const c = viewCenter()
-    // Start one large box wide (5 mm) if calibrated, else a fixed screen size.
-    const half = kind === 'time'
-      ? (cal.pxPerMmX ? cal.pxPerMmX * 10 : 80 / view.s)
-      : (cal.pxPerMmY ? cal.pxPerMmY * 5 : 60 / view.s)
+    const half = kind === 'time' ? (cal.pxPerMmX ? cal.pxPerMmX * 10 : 80 / view.s) : (cal.pxPerMmY ? cal.pxPerMmY * 5 : 60 / view.s)
     const cp: Caliper = kind === 'time'
-      ? { id: nextId++, kind, type: 'R-R', a: { x: c.x - half, y: c.y }, b: { x: c.x + half, y: c.y }, beats: 1, march: false }
+      ? { id: nextId++, kind, type: calipers.some(x => x.type === 'R-R') ? 'QT' : 'R-R', a: { x: c.x - half, y: c.y }, b: { x: c.x + half, y: c.y }, beats: 1, march: false }
       : { id: nextId++, kind, type: 'R amp', a: { x: c.x, y: c.y - half }, b: { x: c.x, y: c.y + half }, beats: 1, march: false }
     setCalipers(cs => [...cs, cp])
-    setSelected(cp.id)
+    setSelected(cp.id); setSelMarker(null)
+    if (tour === 1 && kind === 'time') setTour(2)
+    if (tour === 3 && kind === 'time') setTour(4)
   }
-  const update = (id: number, patch: Partial<Caliper>) =>
-    setCalipers(cs => cs.map(c => (c.id === id ? { ...c, ...patch } : c)))
+  const update = (id: number, patch: Partial<Caliper>) => setCalipers(cs => cs.map(c => (c.id === id ? { ...c, ...patch } : c)))
   const remove = (id: number) => { setCalipers(cs => cs.filter(c => c.id !== id)); setSelected(null) }
 
-  const onHandleDown = (e: RPointerEvent, id: number, leg: 'a' | 'b' | 'bar') => {
+  const startDrag = (e: RPointerEvent, d: Drag) => {
     e.stopPropagation()
     vpRef.current!.setPointerCapture(e.pointerId)
-    drag.current = { id, leg, last: toImage(e.clientX, e.clientY) }
-    setSelected(id)
-    setSelMarker(null)
+    drag.current = d
   }
-  const onPointDown = (e: RPointerEvent, marker: number, idx: number) => {
-    e.stopPropagation()
-    vpRef.current!.setPointerCapture(e.pointerId)
-    drag.current = { marker, idx, last: toImage(e.clientX, e.clientY) }
-    setSelMarker(marker)
-    setSelected(null)
+  const onCaliperDown = (e: RPointerEvent, id: number, leg: 'a' | 'b' | 'bar') => {
+    startDrag(e, { kind: 'caliper', id, leg, last: toImage(e.clientX, e.clientY) })
+    setSelected(id); setSelMarker(null)
   }
-  const onHandleMove = (e: RPointerEvent) => {
+  const onMarkerDown = (e: RPointerEvent, id: number, idx: number) => {
+    startDrag(e, { kind: 'marker', id, idx, last: toImage(e.clientX, e.clientY) })
+    setSelMarker(id); setSelected(null)
+  }
+  const onDragMove = (e: RPointerEvent) => {
     const d = drag.current!
     const p = toImage(e.clientX, e.clientY)
-    if ('marker' in d) {
-      const dx = p.x - d.last.x, dy = p.y - d.last.y
-      d.last = p
-      setMarkers(ms => ms.map(m => m.id !== d.marker ? m : { ...m, pts: m.pts.map((q, i) => i === d.idx ? { x: q.x + dx, y: q.y + dy } : q) }))
-      return
-    }
     const dx = p.x - d.last.x, dy = p.y - d.last.y
     d.last = p
+    if (d.kind === 'box') {
+      setCalBox(b => b && ({ ...b, q: b.q.map((q, i) => (d.corner === 'move' || d.corner === i) ? { x: q.x + dx, y: q.y + dy } : q) as Quad }))
+      return
+    }
+    if (d.kind === 'marker') {
+      setMarkers(ms => ms.map(m => m.id !== d.id ? m : { ...m, pts: m.pts.map((q, i) => i === d.idx ? { x: q.x + dx, y: q.y + dy } : q) }))
+      return
+    }
     setCalipers(cs => cs.map(c => {
       if (c.id !== d.id) return c
       const mv = (q: Point) => ({ x: q.x + dx, y: q.y + dy })
       if (d.leg === 'bar') return { ...c, a: mv(c.a), b: mv(c.b) }
-      // Legs slide along their measuring axis; the bar position follows the drag.
       if (c.kind === 'time') {
-        const a = d.leg === 'a' ? { x: c.a.x + dx, y: c.a.y + dy } : { ...c.a, y: c.a.y + dy }
-        const b = d.leg === 'b' ? { x: c.b.x + dx, y: c.b.y + dy } : { ...c.b, y: c.b.y + dy }
+        const a = d.leg === 'a' ? mv(c.a) : { ...c.a, y: c.a.y + dy }
+        const b = d.leg === 'b' ? mv(c.b) : { ...c.b, y: c.b.y + dy }
         return { ...c, a, b }
       }
-      const a = d.leg === 'a' ? { x: c.a.x + dx, y: c.a.y + dy } : { ...c.a, x: c.a.x + dx }
-      const b = d.leg === 'b' ? { x: c.b.x + dx, y: c.b.y + dy } : { ...c.b, x: c.b.x + dx }
+      const a = d.leg === 'a' ? mv(c.a) : { ...c.a, x: c.a.x + dx }
+      const b = d.leg === 'b' ? mv(c.b) : { ...c.b, x: c.b.x + dx }
       return { ...c, a, b }
     }))
   }
@@ -327,13 +315,11 @@ export default function App() {
     const qt = val('QT')
     const r = val('R amp'), s = val('S amp')
     return {
-      rate: rrMs ? rateFromSpan(rrMs) : null,
-      rrMs,
+      rate: rrMs ? rateFromSpan(rrMs) : null, rrMs,
       pr: val('PR'), qrs: val('QRS'), qt, pw: val('P wave'),
       qtcB: qt && rrMs ? qtcBazett(qt, rrMs) : null,
       qtcF: qt && rrMs ? qtcFridericia(qt, rrMs) : null,
-      pAmp: val('P amp'), rAmp: r, sAmp: s,
-      rs: r && s ? r / s : null,
+      pAmp: val('P amp'), rAmp: r, sAmp: s, rs: r && s ? r / s : null,
     }
   }, [calipers, valueOf, calibratedX, fullCal])
 
@@ -357,19 +343,37 @@ export default function App() {
     return { deg: frontalAxis(nets), nets }
   }, [markers, cal.pxPerMmY])
 
+  const doExport = async () => {
+    setExporting(false)
+    const vp = vpRef.current, el = vp?.querySelector('.stage img') as HTMLImageElement | null, svg = vp?.querySelector('svg.overlay') as SVGSVGElement | null
+    if (!vp || !el || !svg || !img) return
+    setSelected(null); setSelMarker(null)
+    setBusy('Preparing export…')
+    try {
+      const lines: string[] = []
+      const add = (k: string, v: string) => { if (v !== '—') lines.push(`${k} ${v}`) }
+      add('Rate', fmt(results.rate, 0, '/min')); add('PR', fmt(results.pr, 0, ' ms')); add('QRS', fmt(results.qrs, 0, ' ms'))
+      add('QT', fmt(results.qt, 0, ' ms')); add('QTc Bazett', fmt(results.qtcB, 0, ' ms')); add('QTc Fridericia', fmt(results.qtcF, 0, ' ms'))
+      if (axis.deg != null) lines.push(`Axis ${Math.round(axis.deg)}°`)
+      for (const r of stRows) lines.push(`${r.lead} ST ${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`)
+      const r = vp.getBoundingClientRect()
+      await exportView({ img: el, svg, w: img.w, h: img.h, view, vpW: r.width, vpH: r.height, lines })
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === 'AbortError')) setErr(e instanceof Error ? e.message : 'Export failed')
+    } finally { setBusy(null) }
+  }
+
   const sel = calipers.find(c => c.id === selected) || null
   const selM = markers.find(m => m.id === selMarker) || null
-  const startPlacing = (kind: 'ste' | 'axis') => {
-    if (!cal.pxPerMmY) { setErr('Calibrate voltage (vertical) first: tap Calibrate.'); return }
-    setPlacing({ kind, lead: null, pts: [] }); setSelected(null); setSelMarker(null)
-  }
-  const hs = 1 / view.s // keeps handles a constant size on screen
+  const hs = 1 / view.s
 
   // ---------- render ----------
+  const intro = showIntro && <Intro onDemo={loadDemo} onClose={() => { markIntroSeen(); setShowIntro(false) }} />
+
   if (!img) {
     return (
       <div className="app">
-        <header className="bar"><h1>ECG Calipers</h1></header>
+        <header className="bar"><span className="spacer" /><h1>ECGs Made Easy</h1><button className="btn ghost" onClick={() => setShowIntro(true)} aria-label="Help">?</button></header>
         <main className="welcome">
           <p className="lead">Measure a real ECG with calipers you place yourself.</p>
           <label className="btn primary big">
@@ -380,84 +384,127 @@ export default function App() {
             Open an image or PDF
             <input type="file" accept="image/*,application/pdf" hidden onChange={e => onFile(e.target.files?.[0])} />
           </label>
+          <button className="btn big ghostish" onClick={loadDemo}>Try the demo strip with a guided tour</button>
           {err && <p className="err">{err}</p>}
-          <p className="fine">Your ECG never leaves this device. Before you share an export, crop out any patient name, date of birth or record number.</p>
-          <p className="fine">A measurement aid for trained providers. You place every point; the app does not find waves or interpret rhythms.</p>
+          <p className="fine">Your ECG never leaves this device. A measurement aid for trained providers: you place every point; the app does not find waves or interpret rhythms.</p>
         </main>
+        {intro}
       </div>
     )
   }
 
-  const status = busy ? busy : calStep?.axis === 'quad'
-    ? `Straighten: tap the 4 corners of a block of grid boxes (${calStep.pts.length} of 4). A bigger block is more accurate.`
-    : placing?.lead
-    ? `${placing.lead}: tap ${STEPS[placing.kind][placing.pts.length]}`
-    : calStep
-    ? `Calibrate ${calStep.axis === 'x' ? 'time (horizontal)' : 'voltage (vertical)'}: tap ${calStep.pts.length === 0 ? 'the first' : 'the second'} point across a known span of grid`
-    : !calibratedX ? 'Calibrate time to see measurements' : null
+  const tapping = !!placing?.lead
 
   return (
     <div className="app">
       <header className="bar">
-        <button className="btn ghost" onClick={() => { setImg(null); setCalStep(null) }}>New</button>
-        <h1>ECG Calipers</h1>
+        <button className="btn ghost" onClick={() => { setImg(null); setTour(null); setCalBox(null); setPlacing(null) }}>New</button>
+        <h1>ECGs Made Easy</h1>
+        <button className="btn ghost" onClick={() => setShowIntro(true)} aria-label="Help">?</button>
         <button className="btn ghost" onClick={() => setExporting(true)}>Share</button>
         <button className="btn ghost" onClick={() => setSheet(true)}>Results</button>
       </header>
 
-      <div
-        className="viewport"
-        ref={vpRef}
-        onPointerDown={onVpDown}
-        onPointerMove={onVpMove}
-        onPointerUp={onVpUp}
-        onPointerCancel={onVpUp}
-        onWheel={onWheel}
-      >
-        <div className="hud" onPointerDown={e => e.stopPropagation()}>
-      {status && <div className="status">{status}{calStep && <button className="link" onClick={() => setCalStep(null)}>Cancel</button>}
-        {placing?.lead && placing.pts.length === 2 && <button className="link" onClick={() => commitPlacing([...placing.pts, placing.kind === 'axis' ? placing.pts[0] : placing.pts[1]])}>{placing.kind === 'axis' ? 'No S wave' : 'Skip'}</button>}
-        {placing?.lead && <button className="link" onClick={() => setPlacing(null)}>Cancel</button>}</div>}
-      {err && <div className="status err" onClick={() => setErr(null)}>{err} (tap to dismiss)</div>}
-        </div>
+      <div className="viewport" ref={vpRef} onPointerDown={onVpDown} onPointerMove={onVpMove} onPointerUp={onVpUp} onPointerCancel={onVpUp} onWheel={onWheel}>
         <div className="stage" style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`, width: img.w, height: img.h }}>
           <img src={img.src} width={img.w} height={img.h} draggable={false} alt="ECG" />
-          <svg className={`overlay ${placing?.lead || calStep ? 'tapping' : ''}`} width={img.w} height={img.h} viewBox={`0 0 ${img.w} ${img.h}`}>
-            {(calStep?.pts ?? calPrompt?.pts ?? []).map((p, i) => (
-              <circle key={i} cx={p.x} cy={p.y} r={7 * hs} className="calpt" />
+          <svg className={`overlay ${tapping ? 'tapping' : ''}`} width={img.w} height={img.h} viewBox={`0 0 ${img.w} ${img.h}`}>
+            {calipers.map(c => (
+              <CaliperShape key={c.id} c={c} hs={hs} h={img.h} w={img.w} selected={c.id === selected} label={labelFor(c, valueOf(c))} onDown={onCaliperDown} />
+            ))}
+            {cal.pxPerMmY && markers.map(m => (
+              <MarkerShape key={m.id} m={m} hs={hs} pxPerMmY={cal.pxPerMmY!} selected={m.id === selMarker} onDown={onMarkerDown} />
             ))}
             {placing?.pts.map((p, i) => <circle key={`p${i}`} cx={p.x} cy={p.y} r={6 * hs} className="calpt" />)}
-            {cal.pxPerMmY && markers.map(m => (
-              <MarkerShape key={m.id} m={m} hs={hs} pxPerMmY={cal.pxPerMmY!} selected={m.id === selMarker} onDown={onPointDown} />
-            ))}
-            {calipers.map(c => (
-              <CaliperShape key={c.id} c={c} hs={hs} h={img.h} w={img.w} selected={c.id === selected}
-                label={labelFor(c, valueOf(c))} onDown={onHandleDown} />
-            ))}
+            {calBox && (
+              <CalBoxShape q={calBox.q} hs={hs}
+                onCorner={(e, i) => startDrag(e, { kind: 'box', corner: i, last: toImage(e.clientX, e.clientY) })}
+                onMove={e => startDrag(e, { kind: 'box', corner: 'move', last: toImage(e.clientX, e.clientY) })} />
+            )}
           </svg>
         </div>
-        <div className="zoom">
+        <div className="hud" onPointerDown={e => e.stopPropagation()}>
+          {busy && <div className="status">{busy}</div>}
+          {err && <div className="status err" onClick={() => setErr(null)}>{err} (tap to dismiss)</div>}
+          {calibratedX && calibratedY && !calBox && !busy && (
+            <button className="lock" onClick={openCalBox} title="Tap to recalibrate">🔒 Calibrated · {cal.paperSpeedMmPerS} mm/s · {cal.gainMmPerMv} mm/mV</button>
+          )}
+        </div>
+        <div className="zoom" onPointerDown={e => e.stopPropagation()}>
           <button className="btn round" onClick={() => zoomBy(1.4)} aria-label="Zoom in">+</button>
           <button className="btn round" onClick={() => zoomBy(1 / 1.4)} aria-label="Zoom out">−</button>
           <button className="btn round" onClick={fit} aria-label="Fit">⤢</button>
         </div>
       </div>
 
-      {placing && !placing.lead && (
-        <div className="panel">
-          <div className="row"><b>{placing.kind === 'ste' ? 'ST: which lead?' : 'Axis: which lead?'}</b><span className="grow" /><button className="btn small" onClick={() => setPlacing(null)}>Cancel</button></div>
+      {calBox ? (
+        <div className="panel coach">
+          <b>Calibrate: fit the yellow box to the grid</b>
+          <p className="fine">Zoom in, then drag each corner onto the corners of one large square. Drag the edge to move the whole box. A bigger block of squares is more accurate.</p>
+          <div className="row">
+            <span>Box covers</span>
+            <Stepper v={calBox.wBoxes} set={v => setCalBox({ ...calBox, wBoxes: v })} />
+            <span>×</span>
+            <Stepper v={calBox.hBoxes} set={v => setCalBox({ ...calBox, hBoxes: v })} />
+            <span>large boxes ({calBox.wBoxes * 5} × {calBox.hBoxes * 5} mm)</span>
+          </div>
+          <div className="row">
+            {(calibratedX || lastBox) && <button className="btn" onClick={() => setCalBox(null)}>Cancel</button>}
+            <span className="grow" />
+            <button className="btn primary" onClick={lockCal}>🔒 Lock calibration</button>
+          </div>
+        </div>
+      ) : placing && !placing.lead ? (
+        <div className="panel coach">
+          <div className="row"><b>{placing.kind === 'ste' ? 'ST: pick a lead' : 'Axis: pick a lead'}</b><span className="grow" /><button className="btn small" onClick={() => setPlacing(null)}>Done</button></div>
           <div className="chips wrap">
             {(placing.kind === 'axis' ? AXIS_LEADS : [...LEADS]).map(l => {
               const done = markers.some(m => m.kind === placing.kind && m.lead === l)
               return <button key={l} className={`chip ${done ? 'on' : ''}`} style={{ '--c': placing.kind === 'ste' ? '#dc2626' : '#0d9488' } as React.CSSProperties}
-                onClick={() => setPlacing({ ...placing, lead: l })}>{l}{l === 'II' && placing.kind === 'axis' ? ' (optional)' : ''}</button>
+                onClick={() => setPlacing({ ...placing, lead: l })}>{done ? '✓ ' : ''}{l}</button>
             })}
           </div>
-          {placing.kind === 'axis' && <p className="fine">Measure I and aVF; adding II refines the result. Re-tapping a lead replaces it.</p>}
+          <p className="fine">{placing.kind === 'ste' ? 'Measure each lead you want to check. A ✓ lead can be redone.' : 'Lead II is optional and refines the result.'}</p>
         </div>
-      )}
-
-      {selM && !placing && (
+      ) : placing?.lead ? (
+        <div className="panel coach">
+          <div className="row">
+            <b>{placing.kind === 'ste' ? 'ST' : 'Axis'} · lead {placing.lead} · step {placing.pts.length + 1} of 3</b>
+            <span className="grow" />
+            <button className="btn small" onClick={() => setPlacing(null)}>Cancel</button>
+          </div>
+          <div className="steprow">
+            <StepDiagram kind={placing.kind} step={placing.pts.length} />
+            <p className="stepText">{STEPS[placing.kind][placing.pts.length]}</p>
+          </div>
+          <div className="row">
+            {placing.pts.length > 0 && <button className="btn small" onClick={() => setPlacing({ ...placing, pts: placing.pts.slice(0, -1) })}>Undo tap</button>}
+            <span className="grow" />
+            {placing.pts.length === 2 && <button className="btn small primary" onClick={skipLast}>{placing.kind === 'axis' ? 'No S wave' : 'Skip this step'}</button>}
+          </div>
+        </div>
+      ) : sel ? (
+        <div className="panel">
+          <div className="chips">
+            {(sel.kind === 'time' ? TIME_TYPES : AMP_TYPES).map(t => (
+              <button key={t} className={`chip ${sel.type === t ? 'on' : ''}`} style={{ '--c': COLORS[t] } as React.CSSProperties} onClick={() => update(sel.id, { type: t })}>{t}</button>
+            ))}
+          </div>
+          <div className="row">
+            {sel.type === 'R-R' && (
+              <label className="beats">Spans
+                <Stepper v={sel.beats} set={v => update(sel.id, { beats: v })} />
+                {sel.beats === 1 ? 'beat' : 'beats'}
+              </label>
+            )}
+            {sel.kind === 'time' && (
+              <button className={`btn small ${sel.march ? 'primary' : ''}`} onClick={() => { update(sel.id, { march: !sel.march }); if (tour === 2) setTour(3) }}>March out</button>
+            )}
+            <span className="grow" />
+            <button className="btn small danger" onClick={() => remove(sel.id)}>Delete</button>
+          </div>
+        </div>
+      ) : selM ? (
         <div className="panel">
           <div className="row">
             <b>{selM.kind === 'ste' ? 'ST' : 'Axis'} · {selM.lead}</b>
@@ -465,60 +512,27 @@ export default function App() {
             <span className="grow" />
             <button className="btn small danger" onClick={() => { setMarkers(ms => ms.filter(m => m.id !== selM.id)); setSelMarker(null) }}>Delete</button>
           </div>
+          {selM.kind === 'axis' && axis.deg != null && <p className="fine">Axis {Math.round(axis.deg)}° · see Results for the classification and source.</p>}
         </div>
-      )}
-
-      {sel && (
-        <div className="panel">
-          <div className="chips">
-            {(sel.kind === 'time' ? TIME_TYPES : AMP_TYPES).map(t => (
-              <button key={t} className={`chip ${sel.type === t ? 'on' : ''}`} style={{ '--c': COLORS[t] } as React.CSSProperties}
-                onClick={() => update(sel.id, { type: t })}>{t}</button>
-            ))}
-          </div>
+      ) : tour != null ? (
+        <div className="panel coach tour">
+          <div className="row"><b>Guided tour · {tour + 1} of {TOUR.length}</b><span className="grow" /><button className="btn small" onClick={() => setTour(null)}>End tour</button></div>
+          <p>{TOUR[tour]}</p>
           <div className="row">
-            {sel.type === 'R-R' && (
-              <label className="beats">Spans
-                <button className="btn small" onClick={() => update(sel.id, { beats: Math.max(1, sel.beats - 1) })}>−</button>
-                <b>{sel.beats}</b>
-                <button className="btn small" onClick={() => update(sel.id, { beats: sel.beats + 1 })}>+</button>
-                {sel.beats === 1 ? 'beat' : 'beats'}
-              </label>
-            )}
-            {sel.kind === 'time' && (
-              <button className={`btn small ${sel.march ? 'primary' : ''}`} onClick={() => update(sel.id, { march: !sel.march })}>March out</button>
-            )}
+            {tour > 0 && <button className="btn small" onClick={() => setTour(tour - 1)}>Back</button>}
             <span className="grow" />
-            <button className="btn small danger" onClick={() => remove(sel.id)}>Delete</button>
+            {tour < TOUR.length - 1 ? <button className="btn small primary" onClick={() => setTour(tour + 1)}>Next tip</button> : <button className="btn small primary" onClick={() => setTour(null)}>Finish</button>}
           </div>
         </div>
-      )}
+      ) : null}
 
       <nav className="tools">
-        <button className="btn" onClick={() => setCalChoice(true)}>Calibrate</button>
-        <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('time')}>⟷ Time</button>
-        <button className="btn primary" disabled={!!calStep} onClick={() => addCaliper('amp')}>↕ Amp</button>
-        <button className="btn ste" disabled={!!calStep} onClick={() => startPlacing('ste')}>STE</button>
-        <button className="btn" disabled={!!calStep} onClick={() => startPlacing('axis')}>Axis</button>
+        <button className={`btn ${calibratedX ? '' : 'primary pulse-btn'}`} onClick={openCalBox}>{calibratedX ? '🔒 Cal' : 'Calibrate'}</button>
+        <button className="btn primary" onClick={() => addCaliper('time')}>⟷ Time</button>
+        <button className="btn primary" onClick={() => addCaliper('amp')}>↕ Amp</button>
+        <button className="btn ste" onClick={() => startPlacing('ste')}>STE</button>
+        <button className="btn" onClick={() => startPlacing('axis')}>Axis</button>
       </nav>
-
-      {calChoice && (
-        <div className="sheet-bg" onClick={() => setCalChoice(false)}>
-          <div className="sheet" onClick={e => e.stopPropagation()}>
-            <h2>Calibrate</h2>
-            <button className="btn primary big" onClick={() => { setCalChoice(false); setCalStep({ axis: 'quad', pts: [] }) }}>
-              Straighten photo (4 corners)
-            </button>
-            <p className="fine">Best for camera photos taken at an angle. Tap the corners of a block of grid boxes; the photo is squared up and both axes are calibrated at once.</p>
-            <button className="btn big" onClick={() => { setCalChoice(false); setCalStep({ axis: 'x', pts: [] }) }}>
-              Quick (2 taps each way)
-            </button>
-            <p className="fine">Best for flat scans, PDFs and straight-on photos.</p>
-          </div>
-        </div>
-      )}
-
-      {quadPrompt && <QuadPrompt onDone={finishQuad} onCancel={() => setQuadPrompt(null)} />}
 
       {exporting && (
         <div className="sheet-bg" onClick={() => setExporting(false)}>
@@ -533,8 +547,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      {calPrompt && <CalPrompt axis={calPrompt.axis} onDone={finishCal} onCancel={() => setCalPrompt(null)} />}
 
       {sheet && (
         <div className="sheet-bg" onClick={() => setSheet(false)}>
@@ -589,170 +601,18 @@ export default function App() {
           </div>
         </div>
       )}
+      {intro}
     </div>
   )
 }
 
-function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
-  c: Caliper; hs: number; w: number; h: number; selected: boolean; label: string
-  onDown: (e: RPointerEvent, id: number, leg: 'a' | 'b' | 'bar') => void
-}) {
-  const col = COLORS[c.type] ?? COLORS.Other
-  const sw = (selected ? 2.5 : 1.75) * hs
-  const grab = 22 * hs // generous invisible touch target
-  if (c.kind === 'time') {
-    const y = c.a.y
-    const span = c.b.x - c.a.x
-    const marks: number[] = []
-    if (c.march && Math.abs(span) > 2 * hs) {
-      for (let x = c.b.x + span; x > 0 && x < w; x += span) marks.push(x)
-      for (let x = c.a.x - span; x > 0 && x < w; x -= span) marks.push(x)
-    }
-    return (
-      <g style={{ color: col }}>
-        {marks.map((x, i) => <line key={i} x1={x} x2={x} y1={0} y2={h} stroke={col} strokeWidth={1.25 * hs} strokeDasharray={`${6 * hs} ${5 * hs}`} opacity={0.75} />)}
-        <line x1={c.a.x} x2={c.a.x} y1={0} y2={h} stroke={col} strokeWidth={sw} />
-        <line x1={c.b.x} x2={c.b.x} y1={0} y2={h} stroke={col} strokeWidth={sw} />
-        <line x1={c.a.x} x2={c.b.x} y1={y} y2={y} stroke={col} strokeWidth={sw} />
-        <line x1={c.a.x} x2={c.b.x} y1={y} y2={y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'bar')} className="grab" />
-        <line x1={c.a.x} x2={c.a.x} y1={0} y2={h} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'a')} className="grab ew" />
-        <line x1={c.b.x} x2={c.b.x} y1={0} y2={h} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'b')} className="grab ew" />
-        <circle cx={c.a.x} cy={y} r={6 * hs} fill={col} />
-        <circle cx={c.b.x} cy={y} r={6 * hs} fill={col} />
-        <Tag x={(c.a.x + c.b.x) / 2} y={y - 12 * hs} hs={hs} text={label} col={col} />
-      </g>
-    )
-  }
-  const x = c.a.x
+function Stepper({ v, set }: { v: number; set: (v: number) => void }) {
   return (
-    <g>
-      <line x1={0} x2={w} y1={c.a.y} y2={c.a.y} stroke={col} strokeWidth={sw} />
-      <line x1={0} x2={w} y1={c.b.y} y2={c.b.y} stroke={col} strokeWidth={sw} />
-      <line x1={x} x2={x} y1={c.a.y} y2={c.b.y} stroke={col} strokeWidth={sw} />
-      <line x1={x} x2={x} y1={c.a.y} y2={c.b.y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'bar')} className="grab" />
-      <line x1={0} x2={w} y1={c.a.y} y2={c.a.y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'a')} className="grab ns" />
-      <line x1={0} x2={w} y1={c.b.y} y2={c.b.y} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'b')} className="grab ns" />
-      <circle cx={x} cy={c.a.y} r={6 * hs} fill={col} />
-      <circle cx={x} cy={c.b.y} r={6 * hs} fill={col} />
-      <Tag x={x + 10 * hs} y={(c.a.y + c.b.y) / 2} hs={hs} text={label} col={col} anchor="start" />
-    </g>
-  )
-}
-
-function MarkerShape({ m, hs, pxPerMmY, selected, onDown }: {
-  m: Marker; hs: number; pxPerMmY: number; selected: boolean
-  onDown: (e: RPointerEvent, id: number, idx: number) => void
-}) {
-  const col = m.kind === 'ste' ? '#dc2626' : '#0d9488'
-  const [base, p1, p2] = m.pts
-  const mm = pxPerMmY
-  const halfW = 40 * mm // baseline line spans 40 mm either side of the J point
-  const sw = (selected ? 2.25 : 1.5) * hs
-  const dots = m.pts.map((p, i) => (
-    <g key={i}>
-      <circle cx={p.x} cy={p.y} r={5 * hs} fill={i === 0 ? '#fff' : col} stroke={col} strokeWidth={2 * hs} />
-      <circle cx={p.x} cy={p.y} r={18 * hs} fill="transparent" className="grab" onPointerDown={e => onDown(e, m.id, i)} />
-    </g>
-  ))
-  if (m.kind === 'axis') {
-    const net = netQrsMm(base, p1, p2, pxPerMmY)
-    return (
-      <g>
-        <line x1={base.x - halfW / 2} x2={base.x + halfW / 2} y1={base.y} y2={base.y} stroke={col} strokeWidth={sw} strokeDasharray={`${6 * hs} ${4 * hs}`} />
-        {dots}
-        <Tag x={p1.x + 12 * hs} y={p1.y} hs={hs} col={col} anchor="start" text={`${m.lead} net ${net >= 0 ? '+' : ''}${net.toFixed(1)} mm`} />
-      </g>
-    )
-  }
-  // STE: baseline across the lead, a mm ruler at the J point, and a line at the J level.
-  const st = stDeviationMm(base, p1, pxPerMmY)
-  const q = p2 && (p2.x !== p1.x || p2.y !== p1.y) ? heightMm(base, p2, pxPerMmY) : null
-  const n = Math.max(3, Math.ceil(Math.abs(st)) + 2)
-  const ticks = []
-  for (let i = -n; i <= n; i++) {
-    const y = base.y - i * mm
-    const len = (i % 5 === 0 ? 4 : 2) * mm
-    ticks.push(<line key={i} x1={p1.x - len} x2={p1.x} y1={y} y2={y} stroke={col} strokeWidth={(i === 0 ? 1.5 : 1) * hs} />)
-  }
-  return (
-    <g>
-      <line x1={p1.x - halfW} x2={p1.x + halfW} y1={base.y} y2={base.y} stroke={col} strokeWidth={sw} strokeDasharray={`${6 * hs} ${4 * hs}`} />
-      <line x1={p1.x} x2={p1.x + 10 * mm} y1={p1.y} y2={p1.y} stroke={col} strokeWidth={sw} />
-      <line x1={p1.x} x2={p1.x} y1={base.y - n * mm} y2={base.y + n * mm} stroke={col} strokeWidth={hs} />
-      {ticks}
-      {dots}
-      <Tag x={p1.x + 12 * hs} y={p1.y - 10 * hs} hs={hs} col={col} anchor="start"
-        text={`${m.lead} ST ${st >= 0 ? '+' : '−'}${Math.abs(st).toFixed(1)} mm${q ? ` · ${(Math.abs(st) / q).toFixed(2)} of QRS` : ''}`} />
-    </g>
-  )
-}
-
-function Tag({ x, y, hs, text, col, anchor = 'middle' }: { x: number; y: number; hs: number; text: string; col: string; anchor?: 'middle' | 'start' }) {
-  const fs = 14 * hs
-  const wpx = text.length * fs * 0.6 + 10 * hs
-  const left = anchor === 'middle' ? x - wpx / 2 : x
-  return (
-    <g pointerEvents="none">
-      <rect x={left} y={y - fs} width={wpx} height={fs * 1.4} rx={4 * hs} fill="white" stroke={col} strokeWidth={hs} />
-      <text x={left + wpx / 2} y={y} fontSize={fs} textAnchor="middle" fill={col} fontWeight={600}>{text}</text>
-    </g>
-  )
-}
-
-function CalPrompt({ axis, onDone, onCancel }: { axis: 'x' | 'y'; onDone: (mm: number) => void; onCancel: () => void }) {
-  const [boxes, setBoxes] = useState(axis === 'x' ? 5 : 2)
-  const [size, setSize] = useState<'large' | 'small'>('large')
-  const mm = boxes * (size === 'large' ? 5 : 1)
-  return (
-    <div className="sheet-bg">
-      <div className="sheet">
-        <h2>How far apart were your taps?</h2>
-        <p>{axis === 'x' ? 'Horizontal' : 'Vertical'} distance between the two points:</p>
-        <div className="row center">
-          <button className="btn small" onClick={() => setBoxes(b => Math.max(1, b - 1))}>−</button>
-          <b className="num">{boxes}</b>
-          <button className="btn small" onClick={() => setBoxes(b => b + 1)}>+</button>
-          <select value={size} onChange={e => setSize(e.target.value as 'large' | 'small')}>
-            <option value="large">large boxes (5 mm)</option>
-            <option value="small">small boxes (1 mm)</option>
-          </select>
-        </div>
-        <p className="fine">= {mm} mm. Spanning more boxes gives a more accurate calibration.</p>
-        <div className="row">
-          <button className="btn" onClick={onCancel}>Cancel</button>
-          <span className="grow" />
-          <button className="btn primary" onClick={() => onDone(mm)}>Set</button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function QuadPrompt({ onDone, onCancel }: { onDone: (wMm: number, hMm: number) => void; onCancel: () => void }) {
-  const [w, setW] = useState(5)
-  const [h, setH] = useState(4)
-  const step = (v: number, d: number) => Math.max(1, v + d)
-  return (
-    <div className="sheet-bg">
-      <div className="sheet">
-        <h2>How big is the block you tapped?</h2>
-        <p className="fine">Count large boxes (5 mm each).</p>
-        <div className="row center">Wide
-          <button className="btn small" onClick={() => setW(v => step(v, -1))}>−</button><b className="num">{w}</b>
-          <button className="btn small" onClick={() => setW(v => step(v, 1))}>+</button>
-        </div>
-        <div className="row center">Tall
-          <button className="btn small" onClick={() => setH(v => step(v, -1))}>−</button><b className="num">{h}</b>
-          <button className="btn small" onClick={() => setH(v => step(v, 1))}>+</button>
-        </div>
-        <p className="fine">= {w * 5} × {h * 5} mm</p>
-        <div className="row">
-          <button className="btn" onClick={onCancel}>Cancel</button>
-          <span className="grow" />
-          <button className="btn primary" onClick={() => onDone(w * 5, h * 5)}>Straighten</button>
-        </div>
-      </div>
-    </div>
+    <span className="stepper">
+      <button className="btn small" onClick={() => set(Math.max(1, v - 1))} aria-label="Fewer">−</button>
+      <b>{v}</b>
+      <button className="btn small" onClick={() => set(v + 1)} aria-label="More">+</button>
+    </span>
   )
 }
 
@@ -797,10 +657,7 @@ function Row({ k, v, sub, flag }: { k: string; v: string; sub?: string; flag?: F
 function labelFor(c: Caliper, v: number | null): string {
   if (v == null) return c.type
   if (c.kind === 'amp') return `${c.type} ${v.toFixed(2)} mV`
-  if (c.type === 'R-R') {
-    const per = v / c.beats
-    return `${Math.round(rateFromSpan(per))}/min${c.beats > 1 ? ` (${c.beats})` : ''}`
-  }
+  if (c.type === 'R-R') return `${Math.round(rateFromSpan(v / c.beats))}/min${c.beats > 1 ? ` (${c.beats})` : ''}`
   return `${c.type} ${Math.round(v)} ms`
 }
 

@@ -89,3 +89,27 @@ td { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
 .flag q { display: block; margin-top: 4px; font-weight: 400; font-style: italic; color: var(--text); }
 .sheet a { color: inherit; }
 @media (prefers-color-scheme: dark) { .flag.high { color: #fca5a5; } .flag.low { color: #93c5fd; } }
+
+.spacer { width: 40px; }
+.bar h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar .btn.ghost { padding: 6px; }
+.btn.ghostish { background: transparent; border-style: dashed; }
+.lock { margin: 8px; padding: 5px 10px; border-radius: 999px; border: 1px solid #16a34a; background: rgb(255 255 255 / 0.92); color: #15803d; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 3px rgb(0 0 0 / 0.2); }
+.hud { pointer-events: none; }
+.hud > * { pointer-events: auto; }
+.coach { border-top: 3px solid var(--accent); }
+.coach p { margin: 0; }
+.tour { border-top-color: #2563eb; }
+.steprow { display: flex; align-items: center; gap: 12px; }
+.diagram { width: 128px; flex: none; color: var(--text); }
+.stepText { font-size: 17px; font-weight: 600; line-height: 1.35; }
+.stepper { display: inline-flex; align-items: center; gap: 6px; }
+.stepper b { min-width: 2ch; text-align: center; font-size: 17px; }
+.intro p { font-size: 16px; line-height: 1.5; }
+.dots { display: flex; gap: 6px; justify-content: center; }
+.dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+.dots span.on { background: var(--accent); }
+@keyframes pulse { 0% { opacity: 1; r: 8; } 100% { opacity: 0; r: 16; } }
+.pulse { animation: pulse 1.2s ease-out infinite; }
+@keyframes glow { 0%, 100% { box-shadow: 0 0 0 0 rgb(220 38 38 / 0.5); } 50% { box-shadow: 0 0 0 6px rgb(220 38 38 / 0); } }
+.pulse-btn { animation: glow 1.6s ease-in-out infinite; }

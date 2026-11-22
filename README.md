@@ -15,7 +15,7 @@ Installable web app (PWA) for measuring real ECGs with calipers you place yourse
 - [ ] Perspective correction for angled photos
 - [x] Axis from leads I and aVF (II optional)
 - [x] STE tool: user-tapped baseline and J point per lead, mm line, ST deviation, ST:QRS ratio
-- [ ] Cited adult normal-range and ST-threshold flags (AHA/ACC/HRS; Universal Definition of MI)
+- [x] Cited adult normal-range and ST-threshold flags (AHA/ACC/HRS; Universal Definition of MI)
 - [ ] Export with crop-out-identifiers prompt
 
 ## Develop

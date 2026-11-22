@@ -5,6 +5,8 @@ import {
   pxPerMm, pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia,
   type Calibration, type Point,
 } from './lib/measure'
+import { qrsFlag, qtcFlag, stFlag, axisFlag, type Flag, type Patient } from './lib/flags'
+import { REFS, RULES } from './lib/references'
 import { LEADS, stDeviationMm, heightMm, netQrsMm, frontalAxis, type Lead } from './lib/leads'
 
 type TimeType = 'R-R' | 'PR' | 'QRS' | 'QT' | 'P wave' | 'Other'
@@ -59,6 +61,7 @@ export default function App() {
   const [markers, setMarkers] = useState<Marker[]>([])
   const [placing, setPlacing] = useState<Placing>(null)
   const [selMarker, setSelMarker] = useState<number | null>(null)
+  const [patient, setPatient] = useState<Patient>({ sex: 'unset', age: 'unset' })
 
   const vpRef = useRef<HTMLDivElement>(null)
   const pointers = useRef(new Map<number, { x: number; y: number }>())
@@ -293,9 +296,10 @@ export default function App() {
         const st = stDeviationMm(m.pts[0], m.pts[1], cal.pxPerMmY!)
         const hasPeak = m.pts[2] && (m.pts[2].x !== m.pts[1].x || m.pts[2].y !== m.pts[1].y)
         const q = hasPeak ? heightMm(m.pts[0], m.pts[2], cal.pxPerMmY!) : null
-        return { lead: m.lead, st, ratio: q ? Math.abs(st) / q : null }
+        const mv = st / (cal.gainMmPerMv ?? 10)
+        return { lead: m.lead, st, mv, ratio: q ? Math.abs(st) / q : null, flag: stFlag(m.lead, mv, patient) }
       })
-  }, [markers, cal.pxPerMmY])
+  }, [markers, cal.pxPerMmY, cal.gainMmPerMv, patient])
 
   const axis = useMemo(() => {
     if (!cal.pxPerMmY) return { deg: null as number | null, nets: {} as Partial<Record<Lead, number>> }
@@ -453,14 +457,26 @@ export default function App() {
           <div className="sheet" onClick={e => e.stopPropagation()}>
             <h2>Measurements</h2>
             <Settings cal={cal} setCal={setCal} />
+            <div className="row settings">
+              <label>Sex
+                <select value={patient.sex} onChange={e => setPatient(p => ({ ...p, sex: e.target.value as Patient['sex'] }))}>
+                  <option value="unset">Not set</option><option value="male">Male</option><option value="female">Female</option>
+                </select>
+              </label>
+              <label>Age
+                <select value={patient.age} onChange={e => setPatient(p => ({ ...p, age: e.target.value as Patient['age'] }))}>
+                  <option value="unset">Not set</option><option value="under40">16–39</option><option value="40plus">40+</option>
+                </select>
+              </label>
+            </div>
             <table>
               <tbody>
                 <Row k="Heart rate" v={fmt(results.rate, 0, '/min')} sub={results.rrMs ? `R-R ${fmt(results.rrMs, 0, ' ms')}` : undefined} />
                 <Row k="PR" v={fmt(results.pr, 0, ' ms')} />
-                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} />
+                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} flag={qrsFlag(results.qrs)} />
                 <Row k="QT" v={fmt(results.qt, 0, ' ms')} />
-                <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} />
-                <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} />
+                <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} flag={qtcFlag(results.qtcB, patient)} />
+                <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} flag={qtcFlag(results.qtcF, patient)} />
                 <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} />
                 <Row k="P amplitude" v={fmt(results.pAmp, 2, ' mV')} />
                 <Row k="R amplitude" v={fmt(results.rAmp, 2, ' mV')} />
@@ -472,16 +488,19 @@ export default function App() {
               <>
                 <h3>ST deviation at the J point</h3>
                 <table><tbody>
-                  {stRows.map(r => <Row key={r.lead} k={r.lead} v={`${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`} sub={r.ratio != null ? `ST:QRS ${r.ratio.toFixed(2)}` : undefined} />)}
+                  {stRows.map(r => <Row key={r.lead} k={r.lead} v={`${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`} sub={`${r.mv >= 0 ? '+' : '−'}${Math.abs(r.mv).toFixed(2)} mV${r.ratio != null ? ` · ST:QRS ${r.ratio.toFixed(2)}` : ''}`} flag={r.flag} />)}
                 </tbody></table>
               </>
             )}
             <h3>Frontal QRS axis</h3>
             <table><tbody>
               <Row k="Axis" v={axis.deg == null ? '—' : `${axis.deg >= 0 ? '+' : '−'}${Math.abs(Math.round(axis.deg))}°`}
+                flag={axisFlag(axis.deg)}
                 sub={Object.keys(axis.nets).length ? (Object.entries(axis.nets) as [Lead, number][]).map(([l, v]) => `${l} ${v >= 0 ? '+' : ''}${v.toFixed(1)} mm`).join(' · ') : 'Use Axis to measure leads I and aVF'} />
             </tbody></table>
-            <p className="fine">Values come only from calipers you placed. QTc needs an R-R and a QT caliper. Normal-range flags will be added once each limit is checked against its cited guideline.</p>
+            <p className="fine">Values come only from points you placed. Flags are for adults (over 16) and compare each value with the cited guideline; tap a flag to see the source's words. They are reference marks, not a diagnosis. The ST flags look at one lead at a time: contiguous-lead criteria are yours to apply. Part IV recommends regression-based QT correction over Bazett; Bazett and Fridericia are shown side by side for comparison.</p>
+            <h3>Sources</h3>
+            {Object.values(REFS).map(r => <p key={r.id} className="fine"><a href={r.url} target="_blank" rel="noreferrer">{r.citation}</a></p>)}
             <button className="btn primary" onClick={() => setSheet(false)}>Done</button>
           </div>
         </div>
@@ -645,8 +664,22 @@ function Settings({ cal, setCal }: { cal: Partial<Calibration>; setCal: (f: (c: 
   )
 }
 
-function Row({ k, v, sub }: { k: string; v: string; sub?: string }) {
-  return <tr><th>{k}{sub && <small>{sub}</small>}</th><td>{v}</td></tr>
+function Row({ k, v, sub, flag }: { k: string; v: string; sub?: string; flag?: Flag | null }) {
+  const [open, setOpen] = useState(false)
+  const rule = flag ? RULES[flag.rule] : null
+  return (
+    <tr>
+      <th>{k}{sub && <small>{sub}</small>}
+        {flag && rule && (
+          <button className={`flag ${flag.level}`} onClick={() => setOpen(o => !o)}>
+            {flag.text} <span className="src">· {REFS[rule.ref].short}, p. {rule.page}</span>
+            {open && <q>{rule.quote}</q>}
+          </button>
+        )}
+      </th>
+      <td>{v}</td>
+    </tr>
+  )
 }
 
 function labelFor(c: Caliper, v: number | null): string {

@@ -33,6 +33,8 @@ export const RULES = {
   stV23: { ref: 'partIV', page: 'e243', quote: 'abnormal J-point elevation in V2 and V3 … 0.2 mV for men 40 years of age and older and 0.25 mV for men less than 40 years of age … adult women in V2 and V3 is 0.15 mV' },
   stOther: { ref: 'partIV', page: 'e243', quote: 'The threshold recommended for abnormal J-point elevation for men and women in all other standard leads is 0.1 mV' },
   stDep: { ref: 'partIV', page: 'e243', quote: '−0.05 as the recommended threshold value for abnormal J-point depression in leads V2 and V3 in men and women and −0.1 mV in all other leads' },
+  rwatV56: { ref: 'partIII', page: 'e237', quote: 'Complete LBBB criterion 4: R peak time greater than 60 ms in leads V5 and V6 but normal in leads V1, V2, and V3' },
+  rwatAvl: { ref: 'partIII', page: 'e237', quote: 'Left anterior fascicular block criterion 3: R-peak time in lead aVL of 45 ms or more' },
   axis: { ref: 'partIII', page: 'e236', quote: 'In adults, the normal QRS axis is considered to be within −30° and 90°. Left-axis deviation is −30° and beyond … right-axis deviation in adults is from 90° to 120° … between 120° and 180°' },
 } satisfies Record<string, Rule>
 

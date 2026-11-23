@@ -15,7 +15,67 @@ export interface Caliper {
   band: boolean
 }
 
-export interface Marker { id: number; kind: 'ste' | 'axis'; lead: Lead; pts: Point[] }
+export interface Marker { id: number; kind: 'ste' | 'axis' | 'pq' | 'qrs'; lead: Lead; pts: Point[]; roles?: string[] }
+
+const ROLE_COLOR: Record<string, string> = {
+  'P onset': '#059669', 'P end': '#059669', 'QRS onset': '#db2777', 'R peak': '#7c3aed', 'S nadir': '#0891b2', 'QRS end': '#db2777', Notch: '#ea580c',
+}
+const ROLE_SHORT: Record<string, string> = { 'P onset': 'P↑', 'P end': 'P↓', 'QRS onset': 'Q↑', 'R peak': 'R', 'S nadir': 'S', 'QRS end': 'J', Notch: 'n' }
+
+/** Vertical marks the user placed within one complex, with the intervals between them bracketed underneath. */
+function MarksShape({ m, hs, mm, selected, intervals, onDown }: {
+  m: Marker; hs: number; mm: number; selected: boolean
+  intervals: { label: string; ms: number; key: string }[]
+  onDown: (e: RPointerEvent, id: number, idx: number | 'all') => void
+}) {
+  const roles = m.roles ?? []
+  const y0 = m.pts.reduce((a, p) => a + p.y, 0) / m.pts.length
+  const top = y0 - 12 * mm, bot = y0 + 12 * mm
+  const x = (r: string) => { const i = roles.indexOf(r); return i < 0 ? null : m.pts[i].x }
+  const shade = (a: string, b: string, col: string, op: number) => {
+    const xa = x(a), xb = x(b)
+    return xa != null && xb != null ? <rect x={Math.min(xa, xb)} y={top} width={Math.abs(xb - xa)} height={bot - top} fill={col} opacity={op} /> : null
+  }
+  const spans: Record<string, [string, string]> = {
+    pDur: ['P onset', 'P end'], pr: ['P onset', 'QRS onset'], prSeg: ['P end', 'QRS onset'],
+    qrs: ['QRS onset', 'QRS end'], rwat: ['QRS onset', 'R peak'], rs: ['QRS onset', 'S nadir'],
+  }
+  const xs = m.pts.map(p => p.x)
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2
+  const fs = 11 * hs
+  return (
+    <g>
+      {m.kind === 'pq' ? <>{shade('P onset', 'P end', '#059669', 0.22)}{shade('P end', 'QRS onset', '#7c3aed', 0.12)}</>
+        : <>{shade('QRS onset', 'QRS end', '#db2777', selected ? 0.2 : 0.14)}</>}
+      {m.pts.map((p, i) => {
+        const col = ROLE_COLOR[roles[i]] ?? '#475569'
+        return (
+          <g key={i}>
+            <line x1={p.x} x2={p.x} y1={top} y2={bot} stroke={col} strokeWidth={(selected ? 2 : 1.4) * hs} strokeDasharray={roles[i] === 'Notch' ? `${4 * hs} ${3 * hs}` : undefined} />
+            <circle cx={p.x} cy={p.y} r={3.5 * hs} fill={col} />
+            <text x={p.x} y={top - 3 * hs} fontSize={fs} textAnchor="middle" fill={col} fontWeight={700} pointerEvents="none">{ROLE_SHORT[roles[i]] ?? ''}</text>
+            <line x1={p.x} x2={p.x} y1={top} y2={bot} stroke="transparent" strokeWidth={22 * hs} className="grab ew" onPointerDown={e => onDown(e, m.id, i)} />
+          </g>
+        )
+      })}
+      {intervals.filter(iv => spans[iv.key]).map((iv, k) => {
+        const [a, b] = spans[iv.key]
+        const xa = x(a)!, xb = x(b)!
+        const y = bot + (5 + k * 5) * mm * 0.8
+        return (
+          <g key={iv.key} pointerEvents="none">
+            <line x1={xa} x2={xb} y1={y} y2={y} stroke="#334155" strokeWidth={1.2 * hs} />
+            <line x1={xa} x2={xa} y1={y - 3 * hs} y2={y + 3 * hs} stroke="#334155" strokeWidth={1.2 * hs} />
+            <line x1={xb} x2={xb} y1={y - 3 * hs} y2={y + 3 * hs} stroke="#334155" strokeWidth={1.2 * hs} />
+            <text x={Math.max(xa, xb) + 4 * hs} y={y + 4 * hs} fontSize={fs} fill="#334155" fontWeight={600}>{iv.label} {Math.round(iv.ms)}</text>
+          </g>
+        )
+      })}
+      <Tag x={cx} y={top - 18 * hs} hs={hs} col={m.kind === 'pq' ? '#059669' : '#db2777'} text={`${m.lead} ${m.kind === 'pq' ? 'P→QRS' : 'QRS'}`} />
+      <rect x={cx - 40 * hs} y={top - 38 * hs} width={80 * hs} height={26 * hs} fill="transparent" className="grab" onPointerDown={e => onDown(e, m.id, 'all')} />
+    </g>
+  )
+}
 
 export const COLORS: Record<string, string> = {
   'R-R': '#2563eb', PR: '#7c3aed', QRS: '#db2777', QT: '#ea580c', 'P wave': '#059669',
@@ -112,10 +172,12 @@ export function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
   )
 }
 
-export function MarkerShape({ m, hs, pxPerMmY, selected, onDown }: {
+export function MarkerShape({ m, hs, pxPerMmY, selected, onDown, intervals }: {
   m: Marker; hs: number; pxPerMmY: number; selected: boolean
-  onDown: (e: RPointerEvent, id: number, idx: number) => void
+  onDown: (e: RPointerEvent, id: number, idx: number | 'all') => void
+  intervals?: { label: string; ms: number; key: string }[]
 }) {
+  if (m.kind === 'pq' || m.kind === 'qrs') return <MarksShape m={m} hs={hs} mm={pxPerMmY} selected={selected} intervals={intervals ?? []} onDown={onDown} />
   const col = m.kind === 'ste' ? '#dc2626' : '#0d9488'
   const [base, p1, p2] = m.pts
   const mm = pxPerMmY

@@ -9,13 +9,28 @@ import { pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia, type Calibratio
 import { qrsFlag, qtcFlag, stFlag, axisFlag, type Flag, type Patient } from './lib/flags'
 import { REFS, RULES } from './lib/references'
 import { LEADS, stDeviationMm, heightMm, netQrsMm, frontalAxis, type Lead } from './lib/leads'
+import { MARK_ROLES, SKIPPABLE, markIntervals } from './lib/marks'
+import { rwatFlag } from './lib/flags'
 import { CaliperShape, MarkerShape, CalBoxShape, StepDiagram, COLORS, type Caliper, type Marker } from './components/shapes'
 import { Intro, TOUR } from './components/Intro'
 
 const TIME_TYPES = ['R-R', 'PR', 'QRS', 'QT', 'P wave', 'Other']
 const AMP_TYPES = ['P amp', 'R amp', 'S amp', 'Other']
 
-type Placing = null | { kind: 'ste' | 'axis'; lead: Lead | null; pts: Point[] }
+type MKind = 'ste' | 'axis' | 'pq' | 'qrs'
+type Placing = null | { kind: MKind; lead: Lead | null; pts: Point[]; roles: string[]; skipped: string[]; notch?: boolean }
+const isMarks = (k: MKind): k is 'pq' | 'qrs' => k === 'pq' || k === 'qrs'
+const MARK_HELP: Record<string, string> = {
+  'P onset': 'Tap where the P wave leaves the baseline.',
+  'P end': 'Tap where the P wave returns to the baseline.',
+  'QRS onset': 'Tap the first deflection of the QRS.',
+  'R peak': 'Tap the peak of the R wave (for R-wave peak time).',
+  'S nadir': 'Tap the deepest point of the S wave.',
+  'QRS end': 'Tap where the QRS ends (the J point).',
+  Notch: 'Tap the notch or slur.',
+}
+const KIND_NAME: Record<MKind, string> = { ste: 'ST', axis: 'Axis', pq: 'P → QRS', qrs: 'QRS marks' }
+const KIND_COLOR: Record<MKind, string> = { ste: '#dc2626', axis: '#0d9488', pq: '#059669', qrs: '#db2777' }
 const STEPS: Record<'ste' | 'axis', string[]> = {
   ste: ['Tap the baseline: a flat spot on the TP or PR segment.', 'Tap the J point: where the QRS ends and the ST segment begins.', 'Tap the tallest point of the QRS (for the ST:QRS ratio).'],
   axis: ['Tap the baseline: a flat spot before the QRS.', 'Tap the top of the R wave.', 'Tap the bottom of the S wave.'],
@@ -26,7 +41,7 @@ interface View { s: number; tx: number; ty: number }
 interface CalBox { q: Quad; wBoxes: number; hBoxes: number }
 type Drag =
   | { kind: 'caliper'; id: number; leg: 'a' | 'b' | 'bar'; last: Point }
-  | { kind: 'marker'; id: number; idx: number; last: Point }
+  | { kind: 'marker'; id: number; idx: number | 'all'; last: Point }
   | { kind: 'box'; corner: number | 'move'; last: Point }
 
 let nextId = 1
@@ -229,6 +244,14 @@ export default function App() {
   }
 
   const onTap = (p: Point) => {
+    if (placing?.lead && isMarks(placing.kind)) {
+      const role = placing.notch ? 'Notch' : nextRole(placing)
+      if (!role) return
+      const next = { ...placing, pts: [...placing.pts, p], roles: [...placing.roles, role], notch: false }
+      if (!nextRole(next)) commitMarks(next)
+      else setPlacing(next)
+      return
+    }
     if (placing?.lead) {
       const pts = [...placing.pts, p]
       if (pts.length === 3) commitPlacing(pts)
@@ -243,24 +266,55 @@ export default function App() {
     const done = new Set(ms.filter(m => m.kind === 'axis').map(m => m.lead))
     return !done.has('I') ? 'I' : !done.has('aVF') ? 'aVF' : null
   }
-  const startPlacing = (kind: 'ste' | 'axis') => {
-    if (!cal.pxPerMmY) { setErr('Calibrate first: fit the yellow box to one large square and tap Lock.'); openCalBox(); return }
+  const startPlacing = (kind: MKind) => {
+    if (!cal.pxPerMmY) { setErr('Calibrate first: fit the yellow box to the grid and tap Lock.'); openCalBox(); return }
     setCalBox(null); setSelected(null); setSelMarker(null)
-    setPlacing({ kind, lead: kind === 'axis' ? nextAxisLead(markers) : null, pts: [] })
+    setPlacing({ kind, lead: kind === 'axis' ? nextAxisLead(markers) : null, pts: [], roles: [], skipped: [] })
+  }
+  const nextRole = (pl: NonNullable<Placing>): string | null => {
+    if (!isMarks(pl.kind)) return null
+    return MARK_ROLES[pl.kind].find(r => !pl.roles.includes(r) && !pl.skipped.includes(r)) ?? null
+  }
+  const commitMarks = (pl: NonNullable<Placing>) => {
+    if (!pl.lead) return
+    const m: Marker = { id: nextId++, kind: pl.kind, lead: pl.lead, pts: pl.pts, roles: pl.roles }
+    setMarkers(ms => [...ms, m]) // several beats per lead are allowed: each is its own set
+    setSelMarker(m.id)
+    setPlacing({ kind: pl.kind, lead: null, pts: [], roles: [], skipped: [] })
+  }
+  const undoTap = () => {
+    if (!placing || !placing.pts.length) return
+    setPlacing({ ...placing, pts: placing.pts.slice(0, -1), roles: placing.roles.slice(0, -1) })
+  }
+  const skipRole = () => {
+    if (!placing) return
+    const r = nextRole(placing)
+    if (!r) return
+    const next = { ...placing, skipped: [...placing.skipped, r] }
+    if (!nextRole(next)) commitMarks(next); else setPlacing(next)
+  }
+  /** Copies a mark set one beat over so it can be dragged onto the next complex. */
+  const duplicateMarks = (m: Marker) => {
+    const rr = calipers.filter(x => x.type === 'R-R' && x.band)
+    const xs = m.pts.map(p => p.x)
+    const step = rr.length ? rr.reduce((s, x) => s + Math.abs(x.b.x - x.a.x) / x.beats, 0) / rr.length : 2 * (Math.max(...xs) - Math.min(...xs))
+    const copy: Marker = { ...m, id: nextId++, pts: m.pts.map(p => ({ x: p.x + step, y: p.y })) }
+    setMarkers(ms => [...ms, copy]); setSelMarker(copy.id)
   }
   const commitPlacing = (pts: Point[]) => {
     if (!placing?.lead) return
     const { lead, kind } = placing
     const m: Marker = { id: nextId++, kind, lead, pts }
     const ms = [...markers.filter(x => !(x.kind === kind && x.lead === lead)), m]
+    const blank = { pts: [], roles: [], skipped: [] }
     setMarkers(ms)
     setSelMarker(m.id)
     if (kind === 'axis') {
       const next = nextAxisLead(ms)
-      setPlacing(next ? { kind, lead: next, pts: [] } : null)
+      setPlacing(next ? { kind, lead: next, ...blank } : null)
       if (!next && tour === 5) setSheet(true)
     } else {
-      setPlacing({ kind, lead: null, pts: [] }) // back to the lead list for the next lead
+      setPlacing({ kind, lead: null, ...blank }) // back to the lead list for the next lead
       if (tour === 4) setTour(5)
     }
   }
@@ -313,7 +367,7 @@ export default function App() {
     startDrag(e, { kind: 'caliper', id, leg, last: toImage(e.clientX, e.clientY) })
     setSelected(id); setSelMarker(null)
   }
-  const onMarkerDown = (e: RPointerEvent, id: number, idx: number) => {
+  const onMarkerDown = (e: RPointerEvent, id: number, idx: number | 'all') => {
     startDrag(e, { kind: 'marker', id, idx, last: toImage(e.clientX, e.clientY) })
     setSelMarker(id); setSelected(null)
   }
@@ -325,7 +379,7 @@ export default function App() {
     // Magnifier on the exact point being moved, so the finger never hides it.
     let focus = p
     if (d.kind === 'box' && d.corner !== 'move' && calBox) focus = { x: calBox.q[d.corner].x + dx, y: calBox.q[d.corner].y + dy }
-    if (d.kind === 'marker') { const m = markers.find(x => x.id === d.id); if (m) focus = { x: m.pts[d.idx].x + dx, y: m.pts[d.idx].y + dy } }
+    if (d.kind === 'marker' && d.idx !== 'all') { const m = markers.find(x => x.id === d.id); const i = d.idx; if (m) focus = { x: m.pts[i].x + dx, y: m.pts[i].y + dy } }
     if (d.kind === 'caliper' && d.leg !== 'bar') {
       const c = calipers.find(x => x.id === d.id)
       if (c) focus = c.kind === 'time' ? { x: c[d.leg].x + dx, y: p.y } : { x: p.x, y: c[d.leg].y + dy }
@@ -336,7 +390,7 @@ export default function App() {
       return
     }
     if (d.kind === 'marker') {
-      setMarkers(ms => ms.map(m => m.id !== d.id ? m : { ...m, pts: m.pts.map((q, i) => i === d.idx ? { x: q.x + dx, y: q.y + dy } : q) }))
+      setMarkers(ms => ms.map(m => m.id !== d.id ? m : { ...m, pts: m.pts.map((q, i) => (d.idx === 'all' || i === d.idx) ? { x: q.x + dx, y: q.y + (d.idx === 'all' ? dy : (isMarks(m.kind) ? 0 : dy)) } : q) }))
       return
     }
     setCalipers(cs => cs.map(c => {
@@ -403,6 +457,30 @@ export default function App() {
     for (const m of markers) if (m.kind === 'axis') nets[m.lead] = netQrsMm(m.pts[0], m.pts[1], m.pts[2], cal.pxPerMmY)
     return { deg: frontalAxis(nets), nets }
   }, [markers, cal.pxPerMmY])
+
+  // Marked complexes, averaged per lead and interval across every set the user marked.
+  const markRows = useMemo(() => {
+    if (!cal.pxPerMmX) return []
+    const groups = new Map<string, { lead: Lead; label: string; key: string; ms: number[] }>()
+    for (const m of markers) {
+      if (!isMarks(m.kind)) continue
+      for (const r of markIntervals(m.kind, m.roles ?? [], m.pts, fullCal)) {
+        const id = `${m.lead}|${r.key}|${r.label}`
+        const g = groups.get(id) ?? { lead: m.lead, label: r.label, key: r.key, ms: [] }
+        g.ms.push(r.ms); groups.set(id, g)
+      }
+    }
+    return [...groups.values()]
+      .sort((a, b) => LEADS.indexOf(a.lead) - LEADS.indexOf(b.lead))
+      .map(g => {
+        const mean = g.ms.reduce((a, b) => a + b, 0) / g.ms.length
+        const flag = g.key === 'rwat' ? rwatFlag(g.lead, mean) : g.key === 'qrs' ? qrsFlag(mean) : null
+        return {
+          key: `${g.lead}${g.key}${g.label}`, k: `${g.lead} · ${g.label}`, v: `${Math.round(mean)} ms`, flag,
+          sub: g.ms.length > 1 ? `${g.ms.length} beats · ${Math.round(Math.min(...g.ms))}–${Math.round(Math.max(...g.ms))} ms` : undefined,
+        }
+      })
+  }, [markers, cal.pxPerMmX, fullCal])
 
   const doExport = async () => {
     setExporting(false)
@@ -475,7 +553,8 @@ export default function App() {
               <CaliperShape key={c.id} c={c} hs={hs} h={img.h} w={img.w} selected={c.id === selected} label={labelFor(c, valueOf(c))} onDown={onCaliperDown} />
             ))}
             {cal.pxPerMmY && markers.map(m => (
-              <MarkerShape key={m.id} m={m} hs={hs} pxPerMmY={cal.pxPerMmY!} selected={m.id === selMarker} onDown={onMarkerDown} />
+              <MarkerShape key={m.id} m={m} hs={hs} pxPerMmY={cal.pxPerMmY!} selected={m.id === selMarker} onDown={onMarkerDown}
+                intervals={isMarks(m.kind) && cal.pxPerMmX ? markIntervals(m.kind, m.roles ?? [], m.pts, fullCal) : undefined} />
             ))}
             {placing?.pts.map((p, i) => <circle key={`p${i}`} cx={p.x} cy={p.y} r={6 * hs} className="calpt" />)}
             {calBox && (
@@ -524,32 +603,61 @@ export default function App() {
         </div>
       ) : placing && !placing.lead ? (
         <div className="panel coach">
-          <div className="row"><b>{placing.kind === 'ste' ? 'ST: pick a lead' : 'Axis: pick a lead'}</b><span className="grow" /><button className="btn small" onClick={() => setPlacing(null)}>Done</button></div>
+          <div className="row"><b>{KIND_NAME[placing.kind]}: pick a lead</b><span className="grow" /><button className="btn small" onClick={() => setPlacing(null)}>Done</button></div>
+          {isMarks(placing.kind) && (
+            <div className="seg">
+              <button className={placing.kind === 'pq' ? 'on' : ''} onClick={() => setPlacing({ ...placing, kind: 'pq' })}>P → QRS<small>P duration · PR</small></button>
+              <button className={placing.kind === 'qrs' ? 'on' : ''} onClick={() => setPlacing({ ...placing, kind: 'qrs' })}>QRS<small>onset · R peak · S · notches</small></button>
+            </div>
+          )}
           <div className="chips wrap">
             {(placing.kind === 'axis' ? AXIS_LEADS : [...LEADS]).map(l => {
               const done = markers.some(m => m.kind === placing.kind && m.lead === l)
-              return <button key={l} className={`chip ${done ? 'on' : ''}`} style={{ '--c': placing.kind === 'ste' ? '#dc2626' : '#0d9488' } as React.CSSProperties}
+              return <button key={l} className={`chip ${done ? 'on' : ''}`} style={{ '--c': KIND_COLOR[placing.kind] } as React.CSSProperties}
                 onClick={() => setPlacing({ ...placing, lead: l })}>{done ? '✓ ' : ''}{l}</button>
             })}
           </div>
-          <p className="fine">{placing.kind === 'ste' ? 'Measure each lead you want to check. A ✓ lead can be redone.' : 'Lead II is optional and refines the result.'}</p>
+          <p className="fine">{placing.kind === 'ste' ? 'Measure each lead you want to check. A ✓ lead can be redone.' : placing.kind === 'axis' ? 'Lead II is optional and refines the result.' : 'You can mark several beats in the same lead; each becomes its own set.'}</p>
+        </div>
+      ) : placing?.lead && isMarks(placing.kind) ? (
+        <div className="panel coach">
+          <div className="row">
+            <b>{KIND_NAME[placing.kind]} · lead {placing.lead}</b>
+            <span className="grow" />
+            <button className="btn small" onClick={() => setPlacing(null)}>Cancel</button>
+          </div>
+          <div className="markSteps">
+            {MARK_ROLES[placing.kind].map(r => {
+              const st = placing.roles.includes(r) ? 'done' : placing.skipped.includes(r) ? 'skip' : (!placing.notch && nextRole(placing) === r) ? 'now' : ''
+              return <span key={r} className={st}>{st === 'done' ? '✓ ' : ''}{r}</span>
+            })}
+            {placing.roles.filter(r => r === 'Notch').map((_, i) => <span key={`n${i}`} className="done">✓ Notch</span>)}
+          </div>
+          <p className="stepText">{MARK_HELP[placing.notch ? 'Notch' : nextRole(placing) ?? '']}</p>
+          <p className="fine">Press and slide to aim with the magnifier, then lift to place. Use two fingers to move around.</p>
+          <div className="row">
+            {placing.pts.length > 0 && <button className="btn small" onClick={undoTap}>Undo tap</button>}
+            {placing.kind === 'qrs' && placing.roles.includes('QRS onset') && !placing.notch && <button className="btn small" onClick={() => setPlacing({ ...placing, notch: true })}>+ Notch</button>}
+            <span className="grow" />
+            {!placing.notch && SKIPPABLE.has(nextRole(placing) ?? '') && <button className="btn small primary" onClick={skipRole}>No {nextRole(placing)}</button>}
+          </div>
         </div>
       ) : placing?.lead ? (
         <div className="panel coach">
           <div className="row">
-            <b>{placing.kind === 'ste' ? 'ST' : 'Axis'} · lead {placing.lead} · step {placing.pts.length + 1} of 3</b>
+            <b>{KIND_NAME[placing.kind]} · lead {placing.lead} · step {placing.pts.length + 1} of 3</b>
             <span className="grow" />
             <button className="btn small" onClick={() => setPlacing(null)}>Cancel</button>
           </div>
           <div className="steprow">
-            <StepDiagram kind={placing.kind} step={placing.pts.length} />
+            <StepDiagram kind={placing.kind as 'ste' | 'axis'} step={placing.pts.length} />
             <div>
-              <p className="stepText">{STEPS[placing.kind][placing.pts.length]}</p>
+              <p className="stepText">{STEPS[placing.kind as "ste" | "axis"][placing.pts.length]}</p>
               <p className="fine">Press and slide to aim with the magnifier, then lift to place. Use two fingers to move around.</p>
             </div>
           </div>
           <div className="row">
-            {placing.pts.length > 0 && <button className="btn small" onClick={() => setPlacing({ ...placing, pts: placing.pts.slice(0, -1) })}>Undo tap</button>}
+            {placing.pts.length > 0 && <button className="btn small" onClick={undoTap}>Undo tap</button>}
             <span className="grow" />
             {placing.pts.length === 2 && <button className="btn small primary" onClick={skipLast}>{placing.kind === 'axis' ? 'No S wave' : 'Skip this step'}</button>}
           </div>
@@ -583,9 +691,10 @@ export default function App() {
       ) : selM ? (
         <div className="panel">
           <div className="row">
-            <b>{selM.kind === 'ste' ? 'ST' : 'Axis'} · {selM.lead}</b>
-            <span className="fine">Drag any dot to adjust.</span>
+            <b>{KIND_NAME[selM.kind]} · {selM.lead}</b>
+            <span className="fine">{isMarks(selM.kind) ? 'Drag a mark to adjust, or the label to move the set.' : 'Drag any dot to adjust.'}</span>
             <span className="grow" />
+            {isMarks(selM.kind) && <button className="btn small" onClick={() => duplicateMarks(selM)}>Duplicate</button>}
             <button className="btn small danger" onClick={() => { setMarkers(ms => ms.filter(m => m.id !== selM.id)); setSelMarker(null) }}>Delete</button>
           </div>
           {selM.kind === 'axis' && axis.deg != null && <p className="fine">Axis {Math.round(axis.deg)}° · see Results for the classification and source.</p>}
@@ -606,6 +715,7 @@ export default function App() {
         <button className={`btn ${calibratedX ? '' : 'primary pulse-btn'}`} onClick={openCalBox}>{calibratedX ? '🔒 Cal' : 'Calibrate'}</button>
         <button className="btn primary" onClick={() => addCaliper('time')}>⟷ Time</button>
         <button className="btn primary" onClick={() => addCaliper('amp')}>↕ Amp</button>
+        <button className="btn" onClick={() => startPlacing('pq')}>Marks</button>
         <button className="btn ste" onClick={() => startPlacing('ste')}>STE</button>
         <button className="btn" onClick={() => startPlacing('axis')}>Axis</button>
       </nav>
@@ -661,6 +771,14 @@ export default function App() {
                 <h3>ST deviation at the J point</h3>
                 <table><tbody>
                   {stRows.map(r => <Row key={r.lead} k={r.lead} v={`${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`} sub={`${r.mv >= 0 ? '+' : '−'}${Math.abs(r.mv).toFixed(2)} mV${r.ratio != null ? ` · ST:QRS ${r.ratio.toFixed(2)}` : ''}`} flag={r.flag} />)}
+                </tbody></table>
+              </>
+            )}
+            {markRows.length > 0 && (
+              <>
+                <h3>Marked complexes</h3>
+                <table><tbody>
+                  {markRows.map(r => <Row key={r.key} k={r.k} v={r.v} sub={r.sub} flag={r.flag} />)}
                 </tbody></table>
               </>
             )}

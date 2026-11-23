@@ -1,6 +1,6 @@
 {
-  "name": "ECG Calipers",
-  "short_name": "Calipers",
+  "name": "ECGs Made Easy",
+  "short_name": "ECGs Easy",
   "description": "Measure real ECGs with calipers you place yourself.",
   "start_url": "/",
   "display": "standalone",

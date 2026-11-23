@@ -59,3 +59,11 @@ export function axisFlag(deg: number | null): Flag | null {
   if (deg > 120) return { level: 'high', text: 'Marked right-axis deviation', rule: 'axis' }
   return { level: 'high', text: 'Between −90° and −180°: outside the ranges this source classifies', rule: 'axis' }
 }
+
+/** R-wave peak time (QRS onset to R peak) against the Part III criteria that use it. */
+export function rwatFlag(lead: Lead, ms: number | null): Flag | null {
+  if (ms == null) return null
+  if ((lead === 'V5' || lead === 'V6') && ms > 60) return { level: 'high', text: '>60 ms in V5/V6: meets the R-peak-time criterion for complete LBBB (needs normal V1–V3)', rule: 'rwatV56' }
+  if (lead === 'aVL' && Math.round(ms) >= 45) return { level: 'high', text: '≥45 ms in aVL: meets the R-peak-time criterion for left anterior fascicular block', rule: 'rwatAvl' }
+  return null
+}

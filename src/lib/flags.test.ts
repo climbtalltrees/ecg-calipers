@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { qrsFlag, qtcFlag, stFlag, axisFlag, stElevationThresholdMv } from './flags'
+import { qrsFlag, qtcFlag, stFlag, axisFlag, stElevationThresholdMv, rwatFlag } from './flags'
 
 const M40 = { sex: 'male', age: '40plus' } as const
 const M39 = { sex: 'male', age: 'under40' } as const
@@ -55,4 +55,10 @@ describe('axis', () => {
     expect(axisFlag(150)?.text).toMatch(/Marked right/)
     expect(axisFlag(-120)?.text).toMatch(/outside/)
   })
+})
+
+describe('R-wave peak time', () => {
+  it('V5/V6 above 60 ms', () => { expect(rwatFlag('V6', 60)).toBeNull(); expect(rwatFlag('V6', 61)?.rule).toBe('rwatV56') })
+  it('aVL 45 ms or more', () => { expect(rwatFlag('aVL', 44)).toBeNull(); expect(rwatFlag('aVL', 45)?.rule).toBe('rwatAvl') })
+  it('no criterion for other leads', () => expect(rwatFlag('V1', 80)).toBeNull())
 })

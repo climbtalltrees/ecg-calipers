@@ -7,11 +7,13 @@ import { drawDemo } from './lib/demo'
 import { isSquareOn, scaleFromBox, squareAt, type Quad } from './lib/calbox'
 import { pxToMs, pxToMv, rateFromSpan, qtcBazett, qtcFridericia, type Calibration, type Point } from './lib/measure'
 import { qrsFlag, qtcFlag, stFlag, axisFlag, type Flag, type Patient } from './lib/flags'
-import { REFS, RULES } from './lib/references'
+import { REFS, RULES, type Ref } from './lib/references'
 import { LEADS, stDeviationMm, heightMm, netQrsMm, frontalAxis, type Lead } from './lib/leads'
 import { MARK_ROLES, SKIPPABLE, markIntervals } from './lib/marks'
 import { seriesStats } from './lib/rhythm'
-import { rwatFlag } from './lib/flags'
+import { rwatFlag, prFlag, pWidthFlag, pHeightFlag } from './lib/flags'
+import { GuideSheet } from './components/Guide'
+import { GUIDES, type GuideId, type HintKey } from './lib/guides'
 import { CaliperShape, MarkerShape, CalBoxShape, StepDiagram, COLORS, type Caliper, type Marker } from './components/shapes'
 import { Intro, TOUR } from './components/Intro'
 
@@ -74,6 +76,7 @@ export default function App() {
   const [patient, setPatient] = useState<Patient>({ sex: 'unset', age: 'unset' })
   const [showIntro, setShowIntro] = useState(() => !introSeen())
   const [tour, setTour] = useState<number | null>(null)
+  const [guide, setGuide] = useState<GuideId | null>(null)
 
   const vpRef = useRef<HTMLDivElement>(null)
   const pointers = useRef(new Map<number, { x: number; y: number }>())
@@ -500,13 +503,33 @@ export default function App() {
       .sort((a, b) => LEADS.indexOf(a.lead) - LEADS.indexOf(b.lead))
       .map(g => {
         const mean = g.ms.reduce((a, b) => a + b, 0) / g.ms.length
-        const flag = g.key === 'rwat' ? rwatFlag(g.lead, mean) : g.key === 'qrs' ? qrsFlag(mean) : null
+        const flag = g.key === 'rwat' ? rwatFlag(g.lead, mean) : g.key === 'qrs' ? qrsFlag(mean) : g.key === 'pr' ? prFlag(mean) : g.key === 'pDur' ? pWidthFlag(g.lead, mean) : null
         return {
           key: `${g.lead}${g.key}${g.label}`, k: `${g.lead} · ${g.label}`, v: `${Math.round(mean)} ms`, flag,
           sub: g.ms.length > 1 ? `${g.ms.length} beats · ${Math.round(Math.min(...g.ms))}–${Math.round(Math.max(...g.ms))} ms` : undefined,
         }
       })
   }, [markers, cal.pxPerMmX, fullCal])
+
+  // Measured values shown beside guided-check questions. Numbers only.
+  const hints = useMemo(() => {
+    const h: Partial<Record<HintKey, string>> = {}
+    const qrsMarks: string[] = [], rs: string[] = []
+    for (const m of markers) {
+      if (m.kind !== 'qrs' || !cal.pxPerMmX) continue
+      for (const r of markIntervals('qrs', m.roles ?? [], m.pts, fullCal)) {
+        if (r.key === 'qrs') qrsMarks.push(`${m.lead} ${Math.round(r.ms)} ms`)
+        if (r.key === 'rs' && m.lead.startsWith('V')) rs.push(`${m.lead} ${Math.round(r.ms)} ms`)
+      }
+    }
+    const qrsParts = [results.qrs != null ? `QRS caliper ${Math.round(results.qrs)} ms` : null, ...qrsMarks].filter(Boolean)
+    if (qrsParts.length) h.qrs = qrsParts.join(' · ')
+    if (results.rate != null) h.rate = `${Math.round(results.rate)}/min`
+    if (axis.deg != null) h.axis = `${axis.deg >= 0 ? '+' : '−'}${Math.abs(Math.round(axis.deg))}°`
+    if (rs.length) h.rsPrecordial = `onset to S nadir: ${rs.join(' · ')}`
+    if (seriesRows.length) h.march = seriesRows.map(r => `${r.k}: ${r.v}`).join(' · ')
+    return h
+  }, [markers, cal.pxPerMmX, fullCal, results.qrs, results.rate, axis.deg, seriesRows])
 
   const doExport = async () => {
     setExporting(false)
@@ -786,6 +809,11 @@ export default function App() {
         <div className="sheet-bg" onClick={() => setSheet(false)}>
           <div className="sheet" onClick={e => e.stopPropagation()}>
             <h2>Measurements</h2>
+            <div className="guides">
+              <h3>Guided checks</h3>
+              <p className="fine">Step-by-step criteria from your course text and the Brugada steps. You answer each question.</p>
+              {(Object.keys(GUIDES) as GuideId[]).map(id => <button key={id} className="btn" onClick={() => { setSheet(false); setGuide(id) }}>{GUIDES[id].title}</button>)}
+            </div>
             <Settings cal={cal} setCal={setCal} />
             <div className="row settings">
               <label>Sex
@@ -802,13 +830,13 @@ export default function App() {
             <table>
               <tbody>
                 <Row k="Heart rate" v={fmt(results.rate, 0, '/min')} sub={results.rrMs ? `R-R ${fmt(results.rrMs, 0, ' ms')}${results.spread('R-R') ? ` · ${results.spread('R-R')}` : ''}` : undefined} />
-                <Row k="PR" v={fmt(results.pr, 0, ' ms')} sub={results.spread('PR')} />
+                <Row k="PR" v={fmt(results.pr, 0, ' ms')} sub={results.spread('PR')} flag={prFlag(results.pr)} />
                 <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} sub={results.spread('QRS')} flag={qrsFlag(results.qrs)} />
                 <Row k="QT" v={fmt(results.qt, 0, ' ms')} sub={results.spread('QT')} />
                 <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} flag={qtcFlag(results.qtcB, patient)} />
                 <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} flag={qtcFlag(results.qtcF, patient)} />
-                <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} sub={results.spread('P wave')} />
-                <Row k="P amplitude" v={fmt(results.pAmp, 2, ' mV')} />
+                <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} sub={results.spread('P wave')} flag={pWidthFlag(null, results.pw)} />
+                <Row k="P amplitude" v={fmt(results.pAmp, 2, ' mV')} sub={results.pAmp != null ? `${(results.pAmp * (cal.gainMmPerMv ?? 10)).toFixed(1)} mm` : undefined} flag={pHeightFlag(results.pAmp != null ? results.pAmp * (cal.gainMmPerMv ?? 10) : null)} />
                 <Row k="R amplitude" v={fmt(results.rAmp, 2, ' mV')} />
                 <Row k="S amplitude" v={fmt(results.sAmp, 2, ' mV')} />
                 <Row k="R:S ratio" v={fmt(results.rs, 2, '')} />
@@ -845,13 +873,14 @@ export default function App() {
                 flag={axisFlag(axis.deg)}
                 sub={Object.keys(axis.nets).length ? (Object.entries(axis.nets) as [Lead, number][]).map(([l, v]) => `${l} ${v >= 0 ? '+' : ''}${v.toFixed(1)} mm`).join(' · ') : 'Use Axis to measure leads I and aVF'} />
             </tbody></table>
-            <p className="fine">Values come only from points you placed. Flags are for adults (over 16) and compare each value with the cited guideline; tap a flag to see the source's words. They are reference marks, not a diagnosis. The ST flags look at one lead at a time: contiguous-lead criteria are yours to apply. Part IV recommends regression-based QT correction over Bazett; Bazett and Fridericia are shown side by side for comparison.</p>
+            <p className="fine">Values come only from points you placed. Flags are for adults (over 16) and compare each value with the cited guideline or, where marked “Course text”, your EMS 220 text; tap a flag to see the source's words. They are reference marks, not a diagnosis. The ST flags look at one lead at a time: contiguous-lead criteria are yours to apply. Part IV recommends regression-based QT correction over Bazett; Bazett and Fridericia are shown side by side for comparison.</p>
             <h3>Sources</h3>
-            {Object.values(REFS).map(r => <p key={r.id} className="fine"><a href={r.url} target="_blank" rel="noreferrer">{r.citation}</a></p>)}
+            {(Object.values(REFS) as Ref[]).map(r => <p key={r.id} className="fine">{r.url ? <a href={r.url} target="_blank" rel="noreferrer">{r.citation}</a> : r.citation}</p>)}
             <button className="btn primary" onClick={() => setSheet(false)}>Done</button>
           </div>
         </div>
       )}
+      {guide && <GuideSheet key={guide} id={guide} hints={hints} onClose={() => setGuide(null)} onOpen={setGuide} />}
       {intro}
     </div>
   )
@@ -915,7 +944,7 @@ function Row({ k, v, sub, flag }: { k: string; v: string; sub?: string; flag?: F
       <th>{k}{sub && <small>{sub}</small>}
         {flag && rule && (
           <button className={`flag ${flag.level}`} onClick={() => setOpen(o => !o)}>
-            {flag.text} <span className="src">· {REFS[rule.ref].short}, p. {rule.page}</span>
+            {flag.text} <span className="src">· {REFS[rule.ref].short}, {rule.page}</span>
             {open && <q>{rule.quote}</q>}
           </button>
         )}

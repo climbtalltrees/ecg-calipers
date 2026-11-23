@@ -67,3 +67,26 @@ export function rwatFlag(lead: Lead, ms: number | null): Flag | null {
   if (lead === 'aVL' && Math.round(ms) >= 45) return { level: 'high', text: '≥45 ms in aVL: meets the R-peak-time criterion for left anterior fascicular block', rule: 'rwatAvl' }
   return null
 }
+
+// ---- Course-text flags (EMS 220 text). Shown with the text as the source. ----
+
+export function prFlag(ms: number | null): Flag | null {
+  if (ms == null) return null
+  const r = Math.round(ms)
+  if (r < 120) return { level: 'low', text: 'Under 0.12 s: short PR. The text lists retrograde junctional P waves, LGL and WPW as the mechanisms to look for', rule: 'prShort' }
+  if (r > 200) return { level: 'high', text: '>0.20 s: prolonged PR', rule: 'prRange' }
+  return null
+}
+
+/** P duration in a limb lead against the P-mitrale width. Notching is the user's call. */
+export function pWidthFlag(lead: Lead | null, ms: number | null): Flag | null {
+  if (ms == null || Math.round(ms) < 120) return null
+  if (lead && lead !== 'I' && lead !== 'II') return { level: 'info', text: '≥0.12 s; the P-mitrale width is measured in limb leads I and II', rule: 'pMitrale' }
+  return { level: 'high', text: '≥0.12 s: meets the P-mitrale width (also needs an M-shaped notch, humps ≥0.04 s apart: your call)', rule: 'pMitrale' }
+}
+
+/** P height in mm against the P-pulmonale height (limb leads, most often II and III). */
+export function pHeightFlag(mm: number | null): Flag | null {
+  if (mm == null || mm <= 2.5) return null
+  return { level: 'high', text: '>2.5 mm: meets the P-pulmonale height if this is a limb lead (most often II or III) and the P is peaked', rule: 'pPulmonale' }
+}

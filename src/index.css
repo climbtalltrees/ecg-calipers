@@ -130,3 +130,13 @@ td { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
 .markSteps span.skip { text-decoration: line-through; }
 .tools { grid-template-columns: repeat(6, 1fr); gap: 4px; }
 .tools .btn { padding: 10px 2px; font-size: 13px; }
+
+.guides { display: flex; flex-direction: column; gap: 6px; }
+.guides h3 { margin: 0; }
+.trail { margin: 0; padding-left: 20px; font-size: 13px; color: var(--muted); }
+.trail li { margin: 2px 0; }
+.trail b { color: var(--text); }
+.ask, .ending { display: flex; flex-direction: column; gap: 8px; }
+.measured { margin: 0; font-size: 14px; font-weight: 600; padding: 6px 10px; border-radius: 8px; background: color-mix(in srgb, #2563eb 10%, var(--surface)); }
+.ending { border-left: 3px solid #2563eb; padding-left: 10px; }
+.ending q { font-style: italic; }

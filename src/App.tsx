@@ -61,6 +61,8 @@ export default function App() {
   const pointers = useRef(new Map<number, { x: number; y: number }>())
   const gesture = useRef<{ startView: View; start: Map<number, { x: number; y: number }>; downAt: { x: number; y: number }; moved: boolean } | null>(null)
   const drag = useRef<Drag | null>(null)
+  const aim = useRef<{ id: number } | null>(null)
+  const [loupe, setLoupe] = useState<{ p: Point; sx: number; sy: number } | null>(null)
   const viewRef = useRef(view)
   viewRef.current = view
 
@@ -116,8 +118,9 @@ export default function App() {
     setPlacing(null); setSelected(null); setSelMarker(null)
     if (lastBox) { setCalBox(lastBox); return }
     const r = vpRef.current!.getBoundingClientRect()
-    const half = cal.pxPerMmX ? cal.pxPerMmX * 2.5 : Math.min(r.width, r.height) / 10 / viewRef.current.s
-    setCalBox({ q: squareAt(viewCenter(), half), wBoxes: 1, hBoxes: 1 })
+    // Default 25 x 25 mm (5 x 5 large boxes): big enough that a finger's error barely matters.
+    const guess = cal.pxPerMmX ? cal.pxPerMmX * 12.5 : Math.min(r.width, r.height) * 0.3 / viewRef.current.s
+    setCalBox({ q: squareAt(viewCenter(), guess), wBoxes: 5, hBoxes: 5 })
   }
   // Open the box once the new image has been fitted, so it lands in view.
   useEffect(() => {
@@ -153,15 +156,31 @@ export default function App() {
   }
 
   // ---------- pan / pinch / tap ----------
+  const showLoupe = (p: Point, clientX: number, clientY: number) => {
+    const r = vpRef.current!.getBoundingClientRect()
+    setLoupe({ p, sx: clientX - r.left, sy: clientY - r.top })
+  }
   const onVpDown = (e: RPointerEvent) => {
     // A primary pointer means no other finger is down: drop any stale entries.
-    if (e.isPrimary) pointers.current.clear()
+    if (e.isPrimary) { pointers.current.clear(); aim.current = null }
+    else if (aim.current) { aim.current = null; setLoupe(null) } // second finger: pinch instead of aiming
+    if (e.isPrimary && placing?.lead) {
+      // Press and slide to aim a point, with a magnifier; release to place it.
+      ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
+      pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      aim.current = { id: e.pointerId }
+      showLoupe(toImage(e.clientX, e.clientY), e.clientX, e.clientY)
+      gesture.current = null
+      return
+    }
     ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     gesture.current = { startView: view, start: new Map(pointers.current), downAt: { x: e.clientX, y: e.clientY }, moved: pointers.current.size > 1 }
   }
   const onVpMove = (e: RPointerEvent) => {
     if (drag.current) return onDragMove(e)
+    if (aim.current && aim.current.id === e.pointerId) { showLoupe(toImage(e.clientX, e.clientY), e.clientX, e.clientY); return }
+    if (aim.current) return
     if (!pointers.current.has(e.pointerId) || !gesture.current) return
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     const g = gesture.current
@@ -182,7 +201,14 @@ export default function App() {
   }
   const onVpUp = (e: RPointerEvent) => {
     pointers.current.delete(e.pointerId)
+    setLoupe(null)
+    if (aim.current && aim.current.id === e.pointerId) {
+      aim.current = null
+      if (e.type === 'pointerup') onTap(toImage(e.clientX, e.clientY))
+      return
+    }
     if (drag.current) { drag.current = null; gesture.current = null; return }
+    if (!gesture.current && pointers.current.size === 0) return
     const g = gesture.current
     if (g && !g.moved && pointers.current.size === 0 && e.type === 'pointerup') onTap(toImage(e.clientX, e.clientY))
     if (pointers.current.size === 0) gesture.current = null
@@ -249,16 +275,34 @@ export default function App() {
     setPlacing(null); setCalBox(null)
     const c = viewCenter()
     const half = kind === 'time' ? (cal.pxPerMmX ? cal.pxPerMmX * 10 : 80 / view.s) : (cal.pxPerMmY ? cal.pxPerMmY * 5 : 60 / view.s)
+    // One live caliper per kind: tapping the tool again brings it to the middle of the view.
+    const existing = calipers.find(x => x.kind === kind && !x.band)
     const cp: Caliper = kind === 'time'
-      ? { id: nextId++, kind, type: calipers.some(x => x.type === 'R-R') ? 'QT' : 'R-R', a: { x: c.x - half, y: c.y }, b: { x: c.x + half, y: c.y }, beats: 1, march: false }
-      : { id: nextId++, kind, type: 'R amp', a: { x: c.x, y: c.y - half }, b: { x: c.x, y: c.y + half }, beats: 1, march: false }
-    setCalipers(cs => [...cs, cp])
-    setSelected(cp.id); setSelMarker(null)
-    if (tour === 1 && kind === 'time') setTour(2)
-    if (tour === 3 && kind === 'time') setTour(4)
+      ? { id: existing?.id ?? nextId++, kind, type: existing?.type ?? 'R-R', a: { x: c.x - half, y: c.y }, b: { x: c.x + half, y: c.y }, beats: existing?.beats ?? 1, march: false, band: false }
+      : { id: existing?.id ?? nextId++, kind, type: existing?.type ?? 'R amp', a: { x: c.x, y: c.y - half }, b: { x: c.x, y: c.y + half }, beats: 1, march: false, band: false }
+    setCalipers(cs => [...cs.filter(x => x.id !== cp.id), cp])
+    setSelected(cp.id); setSelMarker(null); setHint(null)
   }
   const update = (id: number, patch: Partial<Caliper>) => setCalipers(cs => cs.map(c => (c.id === id ? { ...c, ...patch } : c)))
   const remove = (id: number) => { setCalipers(cs => cs.filter(c => c.id !== id)); setSelected(null) }
+  const [hint, setHint] = useState<string | null>(null)
+  /** Leaves a permanent band where the live caliper is; the caliper stays live for the next one. */
+  const setBand = (c: Caliper) => {
+    const band: Caliper = { ...c, id: nextId++, band: true, march: false }
+    setCalipers(cs => [...cs, band])
+    const n = calipers.filter(x => x.band && x.type === c.type).length + 1
+    if (tour === 1 && c.type === 'R-R') setTour(2)
+    if (tour === 3 && c.type !== 'R-R') setTour(4)
+    setHint(`${c.type} band ${n} set. Drag the caliper to the next ${c.type === 'R-R' ? 'pair of R waves' : 'one'} and set again.`)
+  }
+  /** Copies a band one beat over (one measured R-R if there is one), ready to drag. */
+  const duplicate = (c: Caliper) => {
+    const rr = calipers.filter(x => x.type === 'R-R' && x.band)
+    const step = rr.length ? rr.reduce((s, x) => s + Math.abs(x.b.x - x.a.x) / x.beats, 0) / rr.length : 2 * Math.abs(c.b.x - c.a.x)
+    const copy: Caliper = { ...c, id: nextId++, a: { ...c.a, x: c.a.x + step }, b: { ...c.b, x: c.b.x + step }, march: false }
+    setCalipers(cs => [...cs, copy])
+    setSelected(copy.id)
+  }
 
   const startDrag = (e: RPointerEvent, d: Drag) => {
     e.stopPropagation()
@@ -278,6 +322,15 @@ export default function App() {
     const p = toImage(e.clientX, e.clientY)
     const dx = p.x - d.last.x, dy = p.y - d.last.y
     d.last = p
+    // Magnifier on the exact point being moved, so the finger never hides it.
+    let focus = p
+    if (d.kind === 'box' && d.corner !== 'move' && calBox) focus = { x: calBox.q[d.corner].x + dx, y: calBox.q[d.corner].y + dy }
+    if (d.kind === 'marker') { const m = markers.find(x => x.id === d.id); if (m) focus = { x: m.pts[d.idx].x + dx, y: m.pts[d.idx].y + dy } }
+    if (d.kind === 'caliper' && d.leg !== 'bar') {
+      const c = calipers.find(x => x.id === d.id)
+      if (c) focus = c.kind === 'time' ? { x: c[d.leg].x + dx, y: p.y } : { x: p.x, y: c[d.leg].y + dy }
+    }
+    showLoupe(focus, e.clientX, e.clientY)
     if (d.kind === 'box') {
       setCalBox(b => b && ({ ...b, q: b.q.map((q, i) => (d.corner === 'move' || d.corner === i) ? { x: q.x + dx, y: q.y + dy } : q) as Quad }))
       return
@@ -289,7 +342,9 @@ export default function App() {
     setCalipers(cs => cs.map(c => {
       if (c.id !== d.id) return c
       const mv = (q: Point) => ({ x: q.x + dx, y: q.y + dy })
-      if (d.leg === 'bar') return { ...c, a: mv(c.a), b: mv(c.b) }
+      if (d.leg === 'bar') return c.band && c.kind === 'time'
+        ? { ...c, a: { x: c.a.x + dx, y: c.a.y }, b: { x: c.b.x + dx, y: c.b.y } }
+        : { ...c, a: mv(c.a), b: mv(c.b) }
       if (c.kind === 'time') {
         const a = d.leg === 'a' ? mv(c.a) : { ...c.a, y: c.a.y + dy }
         const b = d.leg === 'b' ? mv(c.b) : { ...c.b, y: c.b.y + dy }
@@ -308,10 +363,11 @@ export default function App() {
   }, [calibratedX, calibratedY, fullCal])
 
   const results = useMemo(() => {
-    const latest = (t: string) => [...calipers].reverse().find(c => c.type === t)
-    const val = (t: string) => { const c = latest(t); return c ? valueOf(c) : null }
-    const rrC = latest('R-R')
-    const rrMs = rrC && calibratedX ? pxToMs(rrC.b.x - rrC.a.x, fullCal) / rrC.beats : null
+    // Set bands are the measurements; the live caliper counts only until a band of that type exists.
+    const of = (t: string) => { const b = calipers.filter(c => c.type === t && c.band); return b.length ? b : calipers.filter(c => c.type === t) }
+    const mean = (xs: number[]) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null
+    const val = (t: string) => mean(of(t).map(valueOf).filter((v): v is number => v != null))
+    const rrMs = calibratedX ? mean(of('R-R').map(c => pxToMs(c.b.x - c.a.x, fullCal) / c.beats)) : null
     const qt = val('QT')
     const r = val('R amp'), s = val('S amp')
     return {
@@ -320,6 +376,11 @@ export default function App() {
       qtcB: qt && rrMs ? qtcBazett(qt, rrMs) : null,
       qtcF: qt && rrMs ? qtcFridericia(qt, rrMs) : null,
       pAmp: val('P amp'), rAmp: r, sAmp: s, rs: r && s ? r / s : null,
+      spread: (t: string) => {
+        const vs = of(t).map(c => (t === 'R-R' ? (valueOf(c) ?? NaN) / c.beats : valueOf(c))).filter((v): v is number => v != null && isFinite(v))
+        if (vs.length < 2) return undefined
+        return `${vs.length} measured · ${Math.round(Math.min(...vs))}–${Math.round(Math.max(...vs))} ms`
+      },
     }
   }, [calipers, valueOf, calibratedX, fullCal])
 
@@ -409,7 +470,8 @@ export default function App() {
         <div className="stage" style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`, width: img.w, height: img.h }}>
           <img src={img.src} width={img.w} height={img.h} draggable={false} alt="ECG" />
           <svg className={`overlay ${tapping ? 'tapping' : ''}`} width={img.w} height={img.h} viewBox={`0 0 ${img.w} ${img.h}`}>
-            {calipers.map(c => (
+            {/* Live calipers draw last so a band just set underneath never steals the grab. */}
+            {[...calipers].sort((x, y) => Number(y.band) - Number(x.band)).map(c => (
               <CaliperShape key={c.id} c={c} hs={hs} h={img.h} w={img.w} selected={c.id === selected} label={labelFor(c, valueOf(c))} onDown={onCaliperDown} />
             ))}
             {cal.pxPerMmY && markers.map(m => (
@@ -430,6 +492,7 @@ export default function App() {
             <button className="lock" onClick={openCalBox} title="Tap to recalibrate">🔒 Calibrated · {cal.paperSpeedMmPerS} mm/s · {cal.gainMmPerMv} mm/mV</button>
           )}
         </div>
+        {loupe && <Loupe img={img} p={loupe.p} sx={loupe.sx} sy={loupe.sy} view={view} vp={vpRef.current} />}
         <div className="zoom" onPointerDown={e => e.stopPropagation()}>
           <button className="btn round" onClick={() => zoomBy(1.4)} aria-label="Zoom in">+</button>
           <button className="btn round" onClick={() => zoomBy(1 / 1.4)} aria-label="Zoom out">−</button>
@@ -440,7 +503,12 @@ export default function App() {
       {calBox ? (
         <div className="panel coach">
           <b>Calibrate: fit the yellow box to the grid</b>
-          <p className="fine">Zoom in, then drag each corner onto the corners of one large square. Drag the edge to move the whole box. A bigger block of squares is more accurate.</p>
+          <p className="fine">Drag each corner onto a heavy grid-line crossing. The magnifier shows exactly where the corner is. Drag an edge to move the whole box.</p>
+          <div className="row">
+            <span>Size</span>
+            <button className={`btn small ${calBox.wBoxes === 5 && calBox.hBoxes === 5 ? 'primary' : ''}`} onClick={() => setCalBox({ ...calBox, wBoxes: 5, hBoxes: 5 })}>25 × 25 mm</button>
+            <button className={`btn small ${calBox.wBoxes === 10 && calBox.hBoxes === 10 ? 'primary' : ''}`} onClick={() => setCalBox({ ...calBox, wBoxes: 10, hBoxes: 10 })}>50 × 50 mm</button>
+          </div>
           <div className="row">
             <span>Box covers</span>
             <Stepper v={calBox.wBoxes} set={v => setCalBox({ ...calBox, wBoxes: v })} />
@@ -475,7 +543,10 @@ export default function App() {
           </div>
           <div className="steprow">
             <StepDiagram kind={placing.kind} step={placing.pts.length} />
-            <p className="stepText">{STEPS[placing.kind][placing.pts.length]}</p>
+            <div>
+              <p className="stepText">{STEPS[placing.kind][placing.pts.length]}</p>
+              <p className="fine">Press and slide to aim with the magnifier, then lift to place. Use two fingers to move around.</p>
+            </div>
           </div>
           <div className="row">
             {placing.pts.length > 0 && <button className="btn small" onClick={() => setPlacing({ ...placing, pts: placing.pts.slice(0, -1) })}>Undo tap</button>}
@@ -485,6 +556,9 @@ export default function App() {
         </div>
       ) : sel ? (
         <div className="panel">
+          {sel.band
+            ? <p className="fine">{sel.type} band. Drag inside it to move it, or drag an edge to adjust it.</p>
+            : <p className="fine">{hint ?? 'Drag the legs onto the interval, choose what it is, then tap Set band to leave it on the strip.'}</p>}
           <div className="chips">
             {(sel.kind === 'time' ? TIME_TYPES : AMP_TYPES).map(t => (
               <button key={t} className={`chip ${sel.type === t ? 'on' : ''}`} style={{ '--c': COLORS[t] } as React.CSSProperties} onClick={() => update(sel.id, { type: t })}>{t}</button>
@@ -500,8 +574,10 @@ export default function App() {
             {sel.kind === 'time' && (
               <button className={`btn small ${sel.march ? 'primary' : ''}`} onClick={() => { update(sel.id, { march: !sel.march }); if (tour === 2) setTour(3) }}>March out</button>
             )}
+            {sel.band && <button className="btn small" onClick={() => duplicate(sel)}>Duplicate</button>}
             <span className="grow" />
             <button className="btn small danger" onClick={() => remove(sel.id)}>Delete</button>
+            {!sel.band && <button className="btn primary" onClick={() => setBand(sel)}>✓ Set band</button>}
           </div>
         </div>
       ) : selM ? (
@@ -567,13 +643,13 @@ export default function App() {
             </div>
             <table>
               <tbody>
-                <Row k="Heart rate" v={fmt(results.rate, 0, '/min')} sub={results.rrMs ? `R-R ${fmt(results.rrMs, 0, ' ms')}` : undefined} />
-                <Row k="PR" v={fmt(results.pr, 0, ' ms')} />
-                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} flag={qrsFlag(results.qrs)} />
-                <Row k="QT" v={fmt(results.qt, 0, ' ms')} />
+                <Row k="Heart rate" v={fmt(results.rate, 0, '/min')} sub={results.rrMs ? `R-R ${fmt(results.rrMs, 0, ' ms')}${results.spread('R-R') ? ` · ${results.spread('R-R')}` : ''}` : undefined} />
+                <Row k="PR" v={fmt(results.pr, 0, ' ms')} sub={results.spread('PR')} />
+                <Row k="QRS" v={fmt(results.qrs, 0, ' ms')} sub={results.spread('QRS')} flag={qrsFlag(results.qrs)} />
+                <Row k="QT" v={fmt(results.qt, 0, ' ms')} sub={results.spread('QT')} />
                 <Row k="QTc (Bazett)" v={fmt(results.qtcB, 0, ' ms')} flag={qtcFlag(results.qtcB, patient)} />
                 <Row k="QTc (Fridericia)" v={fmt(results.qtcF, 0, ' ms')} flag={qtcFlag(results.qtcF, patient)} />
-                <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} />
+                <Row k="P wave width" v={fmt(results.pw, 0, ' ms')} sub={results.spread('P wave')} />
                 <Row k="P amplitude" v={fmt(results.pAmp, 2, ' mV')} />
                 <Row k="R amplitude" v={fmt(results.rAmp, 2, ' mV')} />
                 <Row k="S amplitude" v={fmt(results.sAmp, 2, ' mV')} />
@@ -602,6 +678,26 @@ export default function App() {
         </div>
       )}
       {intro}
+    </div>
+  )
+}
+
+/** A magnifier above the finger, centred on the point being placed or moved. */
+function Loupe({ img, p, sx, sy, view, vp }: { img: LoadedImage; p: Point; sx: number; sy: number; view: View; vp: HTMLDivElement | null }) {
+  const size = 132
+  const z = Math.max(view.s * 3, 2)
+  const W = vp?.clientWidth ?? 400
+  // Sit above the finger; flip below it near the top edge.
+  const left = Math.min(Math.max(sx - size / 2, 4), W - size - 4)
+  const top = sy - size - 48 < 4 ? sy + 48 : sy - size - 48
+  return (
+    <div className="loupe" style={{
+      left, top, width: size, height: size,
+      backgroundImage: `url(${img.src})`,
+      backgroundSize: `${img.w * z}px ${img.h * z}px`,
+      backgroundPosition: `${size / 2 - p.x * z}px ${size / 2 - p.y * z}px`,
+    }}>
+      <span className="cross h" /><span className="cross v" />
     </div>
   )
 }

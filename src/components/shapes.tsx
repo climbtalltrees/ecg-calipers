@@ -11,6 +11,8 @@ export interface Caliper {
   b: Point
   beats: number
   march: boolean
+  /** A set band stays on the strip as a record of one measurement. */
+  band: boolean
 }
 
 export interface Marker { id: number; kind: 'ste' | 'axis'; lead: Lead; pts: Point[] }
@@ -32,6 +34,37 @@ export function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
   const col = COLORS[c.type] ?? COLORS.Other
   const sw = (selected ? 2.5 : 1.5) * hs
   const grab = 24 * hs
+  if (c.kind === 'time' && c.band) {
+    const x0 = Math.min(c.a.x, c.b.x), span = Math.abs(c.b.x - c.a.x)
+    const bands: number[] = []
+    if (c.march && span > 2 * hs) {
+      for (let x = x0 + span; x < w; x += span) bands.push(x)
+      for (let x = x0 - span; x + span > 0; x -= span) bands.push(x)
+    }
+    const y = c.a.y
+    return (
+      <g>
+        {bands.map((x, i) => (
+          <g key={i}>
+            <rect x={x} y={0} width={span} height={h} fill={col} opacity={0.1} />
+            <line x1={x} x2={x} y1={0} y2={h} stroke={col} strokeWidth={hs} strokeDasharray={`${6 * hs} ${5 * hs}`} opacity={0.6} />
+          </g>
+        ))}
+        <rect x={x0} y={0} width={span} height={h} fill={col} opacity={selected ? 0.3 : 0.2} />
+        <line x1={x0} x2={x0} y1={0} y2={h} stroke={col} strokeWidth={(selected ? 2 : 1) * hs} opacity={0.8} />
+        <line x1={x0 + span} x2={x0 + span} y1={0} y2={h} stroke={col} strokeWidth={(selected ? 2 : 1) * hs} opacity={0.8} />
+        {selected && <>
+          {/* Selected: drag inside the column to move it, or an edge to resize. */}
+          <rect x={x0} y={0} width={span} height={h} fill="transparent" className="grab ew" onPointerDown={e => onDown(e, c.id, 'bar')} />
+          <line x1={c.a.x} x2={c.a.x} y1={0} y2={h} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'a')} className="grab ew" />
+          <line x1={c.b.x} x2={c.b.x} y1={0} y2={h} stroke="transparent" strokeWidth={grab} onPointerDown={e => onDown(e, c.id, 'b')} className="grab ew" />
+        </>}
+        <Tag x={x0 + span / 2} y={y - 14 * hs} hs={hs} text={label} col={col} />
+        {/* The label is the band's handle while unselected, so panning over bands still works. */}
+        <rect x={x0 + span / 2 - 40 * hs} y={y - 34 * hs} width={80 * hs} height={36 * hs} fill="transparent" className="grab" onPointerDown={e => onDown(e, c.id, 'bar')} />
+      </g>
+    )
+  }
   if (c.kind === 'time') {
     const y = c.a.y
     const x0 = Math.min(c.a.x, c.b.x), span = Math.abs(c.b.x - c.a.x)
@@ -48,7 +81,7 @@ export function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
             <line x1={x} x2={x} y1={0} y2={h} stroke={col} strokeWidth={hs} strokeDasharray={`${6 * hs} ${5 * hs}`} opacity={0.6} />
           </g>
         ))}
-        <rect x={x0} y={0} width={span} height={h} fill={col} opacity={selected ? 0.22 : 0.16} />
+        <rect x={x0} y={0} width={span} height={h} fill={col} opacity={0.1} />
         <line x1={c.a.x} x2={c.a.x} y1={0} y2={h} stroke={col} strokeWidth={sw} />
         <line x1={c.b.x} x2={c.b.x} y1={0} y2={h} stroke={col} strokeWidth={sw} />
         <line x1={c.a.x} x2={c.b.x} y1={y} y2={y} stroke={col} strokeWidth={sw} />

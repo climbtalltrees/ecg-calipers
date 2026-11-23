@@ -22,8 +22,9 @@ describe('guided checks', () => {
 })
 
 describe('course-text flags', () => {
-  it('PR: short at 110 ms and below, prolonged above 200 ms', () => {
-    expect(prFlag(110)?.level).toBe('low')
+  it('PR: short below 120 ms, prolonged above 200 ms', () => {
+    expect(prFlag(119)?.level).toBe('low')
+    expect(prFlag(119)?.rule).toBe('prShort')
     expect(prFlag(120)).toBeNull()
     expect(prFlag(200)).toBeNull()
     expect(prFlag(201)?.level).toBe('high')

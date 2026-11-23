@@ -50,6 +50,7 @@ export const RULES = {
   axis: { ref: 'partIII', page: 'p. e236', quote: 'In adults, the normal QRS axis is considered to be within −30° and 90°. Left-axis deviation is −30° and beyond … right-axis deviation in adults is from 90° to 120° … between 120° and 180°' },
   // Course text (Brian's EMS 220 text). Used for teaching flags and guided checks.
   prRange: { ref: 'text', page: 'Ch 10, slide 12', quote: 'A normal PR interval is 0.12 to 0.20 seconds in length. A PR interval is considered short if it is less than or equal to 0.11 seconds, and prolonged if it is more than 0.20 seconds.' },
+  prShort: { ref: 'text', page: 'Ch 10, slides 12 and 15', quote: 'A normal PR interval is 0.12 to 0.20 seconds in length. … Three major mechanisms may cause a short PR interval: retrograde junctional P waves, Lown-Ganong-Levine (LGL) syndrome, Wolff-Parkinson-White (WPW) pattern and syndrome.' },
   pMitrale: { ref: 'text', page: 'Ch 9, slides 10 and 12', quote: 'P-mitrale is greater than 0.12 seconds in the limb leads (I and II) and notched (M-shaped). The space between the humps of the “M” should be greater than or equal to 0.04 seconds.' },
   pPulmonale: { ref: 'text', page: 'Ch 9, slide 14', quote: 'P-pulmonale is a peaked, teepee-shaped P wave that is usually more than 2.5 mm high in the limb leads.' },
   rbbb: { ref: 'text', page: 'Ch 13, slides 8 and 13', quote: 'QRS ≥ 0.12 seconds in at least one lead; slurred S wave in leads I and V6; RSR′ pattern in V1 (predominantly positive).' },

@@ -73,7 +73,7 @@ export function rwatFlag(lead: Lead, ms: number | null): Flag | null {
 export function prFlag(ms: number | null): Flag | null {
   if (ms == null) return null
   const r = Math.round(ms)
-  if (r <= 110) return { level: 'low', text: '≤0.11 s: short PR', rule: 'prRange' }
+  if (r < 120) return { level: 'low', text: 'Under 0.12 s: short PR. The text lists retrograde junctional P waves, LGL and WPW as the mechanisms to look for', rule: 'prShort' }
   if (r > 200) return { level: 'high', text: '>0.20 s: prolonged PR', rule: 'prRange' }
   return null
 }

@@ -15,7 +15,57 @@ export interface Caliper {
   band: boolean
 }
 
-export interface Marker { id: number; kind: 'ste' | 'axis' | 'pq' | 'qrs'; lead: Lead; pts: Point[]; roles?: string[] }
+export interface Marker { id: number; kind: 'ste' | 'axis' | 'pq' | 'qrs' | 'pp' | 'rr'; lead: Lead; pts: Point[]; roles?: string[] }
+
+/** Tapped P or R waves with the first interval marched out across the strip, and each interval labelled. */
+function SeriesShape({ m, hs, mm, w, selected, st, onDown }: {
+  m: Marker; hs: number; mm: number; w: number; selected: boolean
+  st?: { intervals: number[]; deviation: number[] } | null
+  onDown: (e: RPointerEvent, id: number, idx: number | 'all') => void
+}) {
+  const col = m.kind === 'pp' ? '#059669' : '#2563eb'
+  const y0 = m.pts.reduce((a, p) => a + p.y, 0) / m.pts.length
+  // P marks sit above the row, R marks below, so both series in one lead stay readable.
+  const off = m.kind === 'pp' ? -1 : 1
+  const top = y0 - 12 * mm, bot = y0 + 12 * mm
+  const xs = m.pts.map(p => p.x)
+  const ticks: number[] = []
+  if (xs.length >= 2 && xs[1] - xs[0] > 2 * hs) {
+    const step = xs[1] - xs[0]
+    for (let x = xs[0] + step; x < w; x += step) ticks.push(x)
+    for (let x = xs[0] - step; x > 0; x -= step) ticks.push(x)
+  }
+  const fs = 11 * hs
+  const ly = off < 0 ? top - 6 * hs : bot + 14 * hs
+  return (
+    <g>
+      {ticks.map((x, i) => (
+        <g key={`t${i}`} pointerEvents="none">
+          <line x1={x} x2={x} y1={top} y2={bot} stroke={col} strokeWidth={1.25 * hs} strokeDasharray={`${5 * hs} ${4 * hs}`} opacity={0.75} />
+          <path d={`M${x - 5 * hs} ${off < 0 ? top - 6 * hs : bot + 6 * hs} L${x + 5 * hs} ${off < 0 ? top - 6 * hs : bot + 6 * hs} L${x} ${off < 0 ? top : bot} Z`} fill={col} opacity={0.75} />
+        </g>
+      ))}
+      {m.pts.map((p, i) => (
+        <g key={i}>
+          <line x1={p.x} x2={p.x} y1={off < 0 ? top : y0} y2={off < 0 ? y0 : bot} stroke={col} strokeWidth={(selected ? 2.5 : 2) * hs} />
+          <circle cx={p.x} cy={p.y} r={4.5 * hs} fill={col} />
+          <text x={p.x} y={off < 0 ? top - 9 * hs : bot + 26 * hs} fontSize={fs} textAnchor="middle" fill={col} fontWeight={700} pointerEvents="none">{m.kind === 'pp' ? 'P' : 'R'}</text>
+          {st && i > 0 && Math.abs(st.deviation[i]) >= 1 && (
+            <text x={p.x + 4 * hs} y={y0 + off * 6 * mm} fontSize={fs} fill={col} pointerEvents="none">{st.deviation[i] > 0 ? '+' : '−'}{Math.round(Math.abs(st.deviation[i]))}</text>
+          )}
+          {m.id >= 0 && <line x1={p.x} x2={p.x} y1={top} y2={bot} stroke="transparent" strokeWidth={20 * hs} className="grab ew" onPointerDown={e => onDown(e, m.id, i)} />}
+        </g>
+      ))}
+      {st && m.pts.slice(1).map((p, i) => (
+        <text key={`iv${i}`} x={(p.x + m.pts[i].x) / 2} y={ly} fontSize={fs} textAnchor="middle" fill="#334155" fontWeight={600} pointerEvents="none">{Math.round(st.intervals[i])}</text>
+      ))}
+      {m.id >= 0 && <>
+        <Tag x={xs[0]} y={off < 0 ? top - 26 * hs : bot + 46 * hs} hs={hs} col={col} text={`${m.lead} ${m.kind === 'pp' ? 'P-P' : 'R-R'}`} />
+        <rect x={xs[0] - 36 * hs} y={(off < 0 ? top - 26 * hs : bot + 46 * hs) - 20 * hs} width={72 * hs} height={26 * hs} fill="transparent" className="grab" onPointerDown={e => onDown(e, m.id, 'all')} />
+      </>}
+    </g>
+  )
+}
 
 const ROLE_COLOR: Record<string, string> = {
   'P onset': '#059669', 'P end': '#059669', 'QRS onset': '#db2777', 'R peak': '#7c3aed', 'S nadir': '#0891b2', 'QRS end': '#db2777', Notch: '#ea580c',
@@ -172,11 +222,15 @@ export function CaliperShape({ c, hs, w, h, selected, label, onDown }: {
   )
 }
 
-export function MarkerShape({ m, hs, pxPerMmY, selected, onDown, intervals }: {
+export function MarkerShape({ m, hs, pxPerMmY, selected, onDown, intervals, series, w }: {
   m: Marker; hs: number; pxPerMmY: number; selected: boolean
   onDown: (e: RPointerEvent, id: number, idx: number | 'all') => void
   intervals?: { label: string; ms: number; key: string }[]
+  series?: { intervals: number[]; deviation: number[] } | null
+  w?: number
+  live?: boolean | null
 }) {
+  if (m.kind === 'pp' || m.kind === 'rr') return <SeriesShape m={m} hs={hs} mm={pxPerMmY} w={w ?? 0} selected={selected} st={series} onDown={onDown} />
   if (m.kind === 'pq' || m.kind === 'qrs') return <MarksShape m={m} hs={hs} mm={pxPerMmY} selected={selected} intervals={intervals ?? []} onDown={onDown} />
   const col = m.kind === 'ste' ? '#dc2626' : '#0d9488'
   const [base, p1, p2] = m.pts

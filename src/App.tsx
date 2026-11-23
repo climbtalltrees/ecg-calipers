@@ -10,6 +10,7 @@ import { qrsFlag, qtcFlag, stFlag, axisFlag, type Flag, type Patient } from './l
 import { REFS, RULES } from './lib/references'
 import { LEADS, stDeviationMm, heightMm, netQrsMm, frontalAxis, type Lead } from './lib/leads'
 import { MARK_ROLES, SKIPPABLE, markIntervals } from './lib/marks'
+import { seriesStats } from './lib/rhythm'
 import { rwatFlag } from './lib/flags'
 import { CaliperShape, MarkerShape, CalBoxShape, StepDiagram, COLORS, type Caliper, type Marker } from './components/shapes'
 import { Intro, TOUR } from './components/Intro'
@@ -17,9 +18,11 @@ import { Intro, TOUR } from './components/Intro'
 const TIME_TYPES = ['R-R', 'PR', 'QRS', 'QT', 'P wave', 'Other']
 const AMP_TYPES = ['P amp', 'R amp', 'S amp', 'Other']
 
-type MKind = 'ste' | 'axis' | 'pq' | 'qrs'
+type MKind = 'ste' | 'axis' | 'pq' | 'qrs' | 'pp' | 'rr'
 type Placing = null | { kind: MKind; lead: Lead | null; pts: Point[]; roles: string[]; skipped: string[]; notch?: boolean }
 const isMarks = (k: MKind): k is 'pq' | 'qrs' => k === 'pq' || k === 'qrs'
+const isSeries = (k: MKind): k is 'pp' | 'rr' => k === 'pp' || k === 'rr'
+const isMarkTool = (k: MKind) => isMarks(k) || isSeries(k)
 const MARK_HELP: Record<string, string> = {
   'P onset': 'Tap where the P wave leaves the baseline.',
   'P end': 'Tap where the P wave returns to the baseline.',
@@ -29,8 +32,8 @@ const MARK_HELP: Record<string, string> = {
   'QRS end': 'Tap where the QRS ends (the J point).',
   Notch: 'Tap the notch or slur.',
 }
-const KIND_NAME: Record<MKind, string> = { ste: 'ST', axis: 'Axis', pq: 'P → QRS', qrs: 'QRS marks' }
-const KIND_COLOR: Record<MKind, string> = { ste: '#dc2626', axis: '#0d9488', pq: '#059669', qrs: '#db2777' }
+const KIND_NAME: Record<MKind, string> = { ste: 'ST', axis: 'Axis', pq: 'P → QRS', qrs: 'QRS marks', pp: 'P-P march', rr: 'R-R march' }
+const KIND_COLOR: Record<MKind, string> = { ste: '#dc2626', axis: '#0d9488', pq: '#059669', qrs: '#db2777', pp: '#059669', rr: '#2563eb' }
 const STEPS: Record<'ste' | 'axis', string[]> = {
   ste: ['Tap the baseline: a flat spot on the TP or PR segment.', 'Tap the J point: where the QRS ends and the ST segment begins.', 'Tap the tallest point of the QRS (for the ST:QRS ratio).'],
   axis: ['Tap the baseline: a flat spot before the QRS.', 'Tap the top of the R wave.', 'Tap the bottom of the S wave.'],
@@ -244,6 +247,10 @@ export default function App() {
   }
 
   const onTap = (p: Point) => {
+    if (placing?.lead && isSeries(placing.kind)) {
+      setPlacing({ ...placing, pts: [...placing.pts, p], roles: [...placing.roles, placing.kind === 'pp' ? 'P' : 'R'] })
+      return
+    }
     if (placing?.lead && isMarks(placing.kind)) {
       const role = placing.notch ? 'Notch' : nextRole(placing)
       if (!role) return
@@ -281,6 +288,12 @@ export default function App() {
     setMarkers(ms => [...ms, m]) // several beats per lead are allowed: each is its own set
     setSelMarker(m.id)
     setPlacing({ kind: pl.kind, lead: null, pts: [], roles: [], skipped: [] })
+  }
+  const finishSeries = () => {
+    if (!placing?.lead || placing.pts.length < 2) return
+    const m: Marker = { id: nextId++, kind: placing.kind as 'pp' | 'rr', lead: placing.lead, pts: [...placing.pts].sort((a, b) => a.x - b.x), roles: placing.roles }
+    setMarkers(ms => [...ms, m]); setSelMarker(m.id)
+    setPlacing(null)
   }
   const undoTap = () => {
     if (!placing || !placing.pts.length) return
@@ -458,6 +471,19 @@ export default function App() {
     return { deg: frontalAxis(nets), nets }
   }, [markers, cal.pxPerMmY])
 
+  const seriesRows = useMemo(() => {
+    if (!cal.pxPerMmX) return []
+    return markers.filter(m => isSeries(m.kind)).map(m => {
+      const st = seriesStats(m.pts.map(p => p.x), fullCal)!
+      const drift = Math.max(...st.deviation.map(Math.abs))
+      return {
+        key: `s${m.id}`, k: `${m.lead} · ${m.kind === 'pp' ? 'P-P' : 'R-R'} (${m.pts.length} beats)`,
+        v: `${Math.round(st.rate)}/min`,
+        sub: `mean ${Math.round(st.mean)} ms · ${Math.round(st.min)}–${Math.round(st.max)} ms · spread ${Math.round(st.spread)} ms · max drift ${Math.round(drift)} ms`,
+      }
+    })
+  }, [markers, cal.pxPerMmX, fullCal])
+
   // Marked complexes, averaged per lead and interval across every set the user marked.
   const markRows = useMemo(() => {
     if (!cal.pxPerMmX) return []
@@ -554,9 +580,14 @@ export default function App() {
             ))}
             {cal.pxPerMmY && markers.map(m => (
               <MarkerShape key={m.id} m={m} hs={hs} pxPerMmY={cal.pxPerMmY!} selected={m.id === selMarker} onDown={onMarkerDown}
-                intervals={isMarks(m.kind) && cal.pxPerMmX ? markIntervals(m.kind, m.roles ?? [], m.pts, fullCal) : undefined} />
+                intervals={isMarks(m.kind) && cal.pxPerMmX ? markIntervals(m.kind, m.roles ?? [], m.pts, fullCal) : undefined}
+                series={isSeries(m.kind) && cal.pxPerMmX ? seriesStats(m.pts.map(p => p.x), fullCal) : undefined} w={img.w}
+                live={null} />
             ))}
-            {placing?.pts.map((p, i) => <circle key={`p${i}`} cx={p.x} cy={p.y} r={6 * hs} className="calpt" />)}
+            {placing?.lead && isSeries(placing.kind) && placing.pts.length > 0 && cal.pxPerMmY ? (
+              <MarkerShape m={{ id: -1, kind: placing.kind, lead: placing.lead, pts: [...placing.pts].sort((a, b) => a.x - b.x), roles: placing.roles }} hs={hs} pxPerMmY={cal.pxPerMmY} selected
+                onDown={() => {}} series={cal.pxPerMmX ? seriesStats(placing.pts.map(p => p.x), fullCal) : undefined} w={img.w} live={true} />
+            ) : placing?.pts.map((p, i) => <circle key={`p${i}`} cx={p.x} cy={p.y} r={6 * hs} className="calpt" />)}
             {calBox && (
               <CalBoxShape q={calBox.q} hs={hs}
                 onCorner={(e, i) => startDrag(e, { kind: 'box', corner: i, last: toImage(e.clientX, e.clientY) })}
@@ -604,10 +635,12 @@ export default function App() {
       ) : placing && !placing.lead ? (
         <div className="panel coach">
           <div className="row"><b>{KIND_NAME[placing.kind]}: pick a lead</b><span className="grow" /><button className="btn small" onClick={() => setPlacing(null)}>Done</button></div>
-          {isMarks(placing.kind) && (
+          {isMarkTool(placing.kind) && (
             <div className="seg">
               <button className={placing.kind === 'pq' ? 'on' : ''} onClick={() => setPlacing({ ...placing, kind: 'pq' })}>P → QRS<small>P duration · PR</small></button>
               <button className={placing.kind === 'qrs' ? 'on' : ''} onClick={() => setPlacing({ ...placing, kind: 'qrs' })}>QRS<small>onset · R peak · S · notches</small></button>
+              <button className={placing.kind === 'pp' ? 'on' : ''} onClick={() => setPlacing({ ...placing, kind: 'pp' })}>P-P march<small>tap every P wave</small></button>
+              <button className={placing.kind === 'rr' ? 'on' : ''} onClick={() => setPlacing({ ...placing, kind: 'rr' })}>R-R march<small>tap every R wave</small></button>
             </div>
           )}
           <div className="chips wrap">
@@ -618,6 +651,21 @@ export default function App() {
             })}
           </div>
           <p className="fine">{placing.kind === 'ste' ? 'Measure each lead you want to check. A ✓ lead can be redone.' : placing.kind === 'axis' ? 'Lead II is optional and refines the result.' : 'You can mark several beats in the same lead; each becomes its own set.'}</p>
+        </div>
+      ) : placing?.lead && isSeries(placing.kind) ? (
+        <div className="panel coach">
+          <div className="row">
+            <b>{KIND_NAME[placing.kind]} · lead {placing.lead} · {placing.pts.length} tapped</b>
+            <span className="grow" />
+            <button className="btn small" onClick={() => setPlacing(null)}>Cancel</button>
+          </div>
+          <p className="stepText">Tap every {placing.kind === 'pp' ? 'P wave (including any hidden in a QRS or T wave)' : 'R wave'} across the strip, left to right.</p>
+          <p className="fine">The first two taps set the interval; it is marched out across the strip so you can see whether each later {placing.kind === 'pp' ? 'P' : 'R'} lands on its mark. Do P-P and R-R in the same lead to compare them.</p>
+          <div className="row">
+            {placing.pts.length > 0 && <button className="btn small" onClick={undoTap}>Undo tap</button>}
+            <span className="grow" />
+            <button className="btn primary" disabled={placing.pts.length < 2} onClick={finishSeries}>Finish</button>
+          </div>
         </div>
       ) : placing?.lead && isMarks(placing.kind) ? (
         <div className="panel coach">
@@ -772,6 +820,15 @@ export default function App() {
                 <table><tbody>
                   {stRows.map(r => <Row key={r.lead} k={r.lead} v={`${r.st >= 0 ? '+' : '−'}${Math.abs(r.st).toFixed(1)} mm`} sub={`${r.mv >= 0 ? '+' : '−'}${Math.abs(r.mv).toFixed(2)} mV${r.ratio != null ? ` · ST:QRS ${r.ratio.toFixed(2)}` : ''}`} flag={r.flag} />)}
                 </tbody></table>
+              </>
+            )}
+            {seriesRows.length > 0 && (
+              <>
+                <h3>Rhythm (tapped beats)</h3>
+                <table><tbody>
+                  {seriesRows.map(r => <Row key={r.key} k={r.k} v={r.v} sub={r.sub} />)}
+                </tbody></table>
+                <p className="fine">Numbers only: the spread is the longest minus the shortest interval, and drift is how far the furthest beat sits from where the first interval marches out. Whether that is regular is your call.</p>
               </>
             )}
             {markRows.length > 0 && (
